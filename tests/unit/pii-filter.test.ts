@@ -131,3 +131,27 @@ describe('PII Filter', () => {
     });
   });
 });
+
+describe('redactPII edge cases', () => {
+  it('masks a 9-digit routing number as an SSN-shaped value', () => {
+    expect(redactPII('Routing: 031000053')).toBe('Routing: ***-**-0053');
+  });
+
+  it('masks a 10-digit timestamp as an account number', () => {
+    expect(redactPII('ts=1758480000')).toBe('ts=****0000');
+  });
+
+  it('masks ZIP+4 whether or not it has a hyphen', () => {
+    expect(redactPII('19301-1234')).toBe('***-**-1234');
+    expect(redactPII('193011234')).toBe('***-**-1234');
+  });
+
+  it('leaves an email untouched', () => {
+    expect(redactPII('me@example.com')).toBe('me@example.com');
+  });
+
+  it('is idempotent', () => {
+    const once = redactPII('SSN 123-45-6789, acct 1234567890, EIN 12-3456789');
+    expect(redactPII(once)).toBe(once);
+  });
+});
