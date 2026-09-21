@@ -1,248 +1,247 @@
-/**
- * Form reading and filling via DOM inspection with accessible labels.
- * Uses Playwright's locator API with role/label targeting for resilience.
- */
-
-import { type Page } from 'playwright';
+import { type Locator, type Page } from 'playwright';
 import { type FormField } from '../types/tax.js';
+import { waitForPageReady } from './wait.js';
 
-/**
- * Read all form fields on the current page by querying input elements
- * and resolving their accessible labels from the DOM.
- */
+export type FieldKind = 'auto' | 'text' | 'select' | 'radio' | 'checkbox';
+
+export interface FieldResult {
+  ok: boolean;
+  matchedLabel?: string;
+  via?: Exclude<FieldKind, 'auto'>;
+  reason?: string;
+  candidates?: string[];
+}
+
+export type LabelResolution =
+  | { ok: true; locator: Locator; matchedLabel: string }
+  | { ok: false; reason: 'not_found' | 'ambiguous'; candidates: string[] };
+
+export function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+export function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message.split('\n')[0] : String(err);
+}
+
 export async function readFormFields(page: Page): Promise<FormField[]> {
   return page.evaluate(() => {
-    const fields: Array<{
-      label: string;
-      value: string;
-      type: string;
-      required: boolean;
-      options?: string[];
-    }> = [];
+    const fields: FormField[] = [];
 
-    function getLabelForElement(el: HTMLElement): string {
-      // Check aria-label
+    function isShown(el: Element): boolean {
+      return el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
+    }
+
+    function labelFor(el: HTMLElement): string {
       const ariaLabel = el.getAttribute('aria-label');
       if (ariaLabel) return ariaLabel;
-
-      // Check associated <label> via id
       const id = el.getAttribute('id');
       if (id) {
         const label = document.querySelector(`label[for="${id}"]`);
         if (label?.textContent?.trim()) return label.textContent.trim();
       }
-
-      // Check wrapping <label>
       const parentLabel = el.closest('label');
       if (parentLabel?.textContent?.trim()) return parentLabel.textContent.trim();
-
-      // Check aria-labelledby
       const labelledBy = el.getAttribute('aria-labelledby');
       if (labelledBy) {
         const labelEl = document.getElementById(labelledBy);
         if (labelEl?.textContent?.trim()) return labelEl.textContent.trim();
       }
-
-      // Fallback: name or placeholder
       return el.getAttribute('name') || el.getAttribute('placeholder') || '';
     }
 
-    // Text inputs, textareas
+    function groupLabel(first: HTMLInputElement, name: string): string {
+      const legend = first.closest('fieldset')?.querySelector('legend');
+      if (legend?.textContent?.trim()) return legend.textContent.trim();
+      let node: Element | null = first.closest('fieldset, div, tr, li, p') ?? first;
+      for (let i = 0; i < 6 && node; i++) {
+        const prev: Element | null = node.previousElementSibling;
+        if (prev) {
+          if (/^(H[1-6]|LABEL|LEGEND|P)$/.test(prev.tagName)) {
+            const text = prev.textContent?.trim();
+            if (text) return text.slice(0, 120);
+          }
+          node = prev;
+        } else {
+          node = node.parentElement;
+        }
+      }
+      return name;
+    }
+
     const textInputs = document.querySelectorAll<HTMLInputElement>(
-      'input[type="text"], input[type="email"], input[type="tel"], input[type="number"], input[type="password"], input:not([type]), textarea'
+      'input[type="text"], input[type="email"], input[type="tel"], input[type="number"], input:not([type]), textarea',
     );
     for (const el of textInputs) {
-      if (el.offsetParent === null) continue; // skip hidden
+      if (!isShown(el)) continue;
       fields.push({
-        label: getLabelForElement(el),
+        label: labelFor(el),
         value: el.value ?? '',
         type: el.type === 'number' ? 'currency' : 'text',
         required: el.required,
       });
     }
 
-    // Select dropdowns
-    const selects = document.querySelectorAll<HTMLSelectElement>('select');
-    for (const el of selects) {
-      if (el.offsetParent === null) continue;
-      const options = Array.from(el.options).map(o => o.text);
+    for (const el of document.querySelectorAll<HTMLSelectElement>('select')) {
+      if (!isShown(el)) continue;
       fields.push({
-        label: getLabelForElement(el),
+        label: labelFor(el),
         value: el.options[el.selectedIndex]?.text ?? '',
         type: 'select',
         required: el.required,
-        options,
+        options: Array.from(el.options).map(o => o.text),
       });
     }
 
-    // Radio buttons (group by name)
-    const radioGroups = new Map<string, { label: string; value: string; options: string[] }>();
-    const radios = document.querySelectorAll<HTMLInputElement>('input[type="radio"]');
-    for (const el of radios) {
-      if (el.offsetParent === null) continue;
+    const groups = new Map<string, { label: string; value: string; options: string[] }>();
+    for (const el of document.querySelectorAll<HTMLInputElement>('input[type="radio"]')) {
+      if (!isShown(el)) continue;
       const name = el.getAttribute('name') ?? '';
-      if (!radioGroups.has(name)) {
-        radioGroups.set(name, { label: '', value: '', options: [] });
+      let group = groups.get(name);
+      if (!group) {
+        group = { label: groupLabel(el, name), value: '', options: [] };
+        groups.set(name, group);
       }
-      const group = radioGroups.get(name)!;
-      const optLabel = getLabelForElement(el);
+      const optLabel = labelFor(el);
       group.options.push(optLabel);
-      if (el.checked) {
-        group.value = optLabel;
-        group.label = name;
-      }
+      if (el.checked) group.value = optLabel;
     }
-    for (const [name, group] of radioGroups) {
-      fields.push({
-        label: group.label || name,
-        value: group.value,
-        type: 'radio',
-        required: false,
-        options: group.options,
-      });
+    for (const group of groups.values()) {
+      fields.push({ label: group.label, value: group.value, type: 'radio', required: false, options: group.options });
     }
 
-    // Checkboxes
-    const checkboxes = document.querySelectorAll<HTMLInputElement>('input[type="checkbox"]');
-    for (const el of checkboxes) {
-      if (el.offsetParent === null) continue;
-      fields.push({
-        label: getLabelForElement(el),
-        value: el.checked ? 'checked' : '',
-        type: 'checkbox',
-        required: el.required,
-      });
+    for (const el of document.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')) {
+      if (!isShown(el)) continue;
+      fields.push({ label: labelFor(el), value: el.checked ? 'checked' : '', type: 'checkbox', required: el.required });
     }
 
     return fields;
-  }) as Promise<FormField[]>;
+  });
 }
 
-/**
- * Fill a text field by its accessible label.
- */
-export async function fillFieldByLabel(page: Page, label: string, value: string): Promise<boolean> {
-  try {
-    const field = page.getByLabel(label, { exact: false });
-    await field.waitFor({ state: 'visible', timeout: 5_000 });
-    await field.clear();
-    await field.fill(value);
-    return true;
-  } catch {
-    return false;
-  }
+async function describeLabels(locator: Locator): Promise<string[]> {
+  return locator.evaluateAll(elements =>
+    elements.map(el => {
+      const ariaLabel = el.getAttribute('aria-label');
+      if (ariaLabel) return ariaLabel;
+      const id = el.getAttribute('id');
+      const forLabel = id ? document.querySelector(`label[for="${id}"]`)?.textContent?.trim() : '';
+      if (forLabel) return forLabel;
+      const wrapped = el.closest('label')?.textContent?.trim();
+      if (wrapped) return wrapped;
+      return el.getAttribute('name') ?? el.tagName.toLowerCase();
+    }),
+  );
 }
 
-/**
- * Select a dropdown option by label.
- */
-export async function selectByLabel(page: Page, label: string, optionText: string): Promise<boolean> {
-  try {
-    const select = page.getByLabel(label, { exact: false });
-    await select.selectOption({ label: optionText });
-    return true;
-  } catch {
-    try {
-      const select = page.getByLabel(label, { exact: false });
-      await select.selectOption({ value: optionText });
-      return true;
-    } catch {
-      return false;
+export async function resolveLabel(page: Page, label: string): Promise<LabelResolution> {
+  const attempts: Locator[] = [
+    page.getByLabel(label, { exact: true }),
+    page.getByLabel(new RegExp(`^\\s*${escapeRegExp(label)}\\s*[:*]?\\s*$`, 'i')),
+    page.getByLabel(label, { exact: false }),
+  ];
+  for (const locator of attempts) {
+    const count = await locator.count();
+    if (count === 1) {
+      const [matchedLabel] = await describeLabels(locator);
+      return { ok: true, locator, matchedLabel };
+    }
+    if (count > 1) {
+      return { ok: false, reason: 'ambiguous', candidates: await describeLabels(locator) };
     }
   }
+  return { ok: false, reason: 'not_found', candidates: [] };
 }
 
-/**
- * Click a radio button by its label text.
- */
-export async function clickRadioByLabel(page: Page, label: string): Promise<boolean> {
+export async function setFieldByLabel(page: Page, label: string, value: string, kind: FieldKind = 'auto'): Promise<FieldResult> {
+  const resolved = await resolveLabel(page, label);
+  if (!resolved.ok) return { ok: false, reason: resolved.reason, candidates: resolved.candidates };
+
+  const { locator, matchedLabel } = resolved;
+  const info = await locator.evaluate(el => ({
+    tag: el.tagName.toLowerCase(),
+    type: el instanceof HTMLInputElement ? el.type : '',
+  }));
+  const detected: Exclude<FieldKind, 'auto'> =
+    info.tag === 'select' ? 'select' : info.type === 'checkbox' ? 'checkbox' : info.type === 'radio' ? 'radio' : 'text';
+  if (kind !== 'auto' && kind !== detected) {
+    return { ok: false, matchedLabel, reason: `field is ${detected}, not ${kind}` };
+  }
+
   try {
-    const radio = page.getByRole('radio', { name: label });
-    await radio.check();
-    return true;
-  } catch {
-    try {
-      const labelEl = page.getByText(label, { exact: false });
-      await labelEl.click();
-      return true;
-    } catch {
-      return false;
+    await locator.waitFor({ state: 'visible', timeout: 1_000 });
+    switch (detected) {
+      case 'select':
+        try {
+          await locator.selectOption({ label: value }, { timeout: 1_000 });
+        } catch {
+          await locator.selectOption({ value }, { timeout: 1_000 });
+        }
+        break;
+      case 'checkbox':
+        await locator.setChecked(/^(true|yes|1|checked|on)$/i.test(value), { timeout: 1_000 });
+        break;
+      case 'radio':
+        await locator.check({ timeout: 1_000 });
+        break;
+      default:
+        await locator.fill(value, { timeout: 1_000 });
     }
+    return { ok: true, matchedLabel, via: detected };
+  } catch (err) {
+    return { ok: false, matchedLabel, via: detected, reason: errorMessage(err) };
   }
 }
 
-/**
- * Check or uncheck a checkbox by label.
- */
-export async function setCheckbox(page: Page, label: string, checked: boolean): Promise<boolean> {
-  try {
-    const cb = page.getByRole('checkbox', { name: label });
-    if (checked) {
-      await cb.check();
-    } else {
-      await cb.uncheck();
-    }
-    return true;
-  } catch {
-    return false;
+export type ButtonResolution =
+  | { ok: true; locator: Locator; name: string }
+  | { ok: false; reason: 'not_found' | 'ambiguous'; candidates: string[] };
+
+export async function findButton(page: Page, name: string): Promise<ButtonResolution> {
+  const exact = page.getByRole('button', { name, exact: true }).or(page.getByRole('link', { name, exact: true }));
+  let target = exact;
+  let count = await exact.count();
+  if (count === 0) {
+    const pattern = new RegExp(`\\b${escapeRegExp(name)}\\b`, 'i');
+    target = page.getByRole('button', { name: pattern }).or(page.getByRole('link', { name: pattern }));
+    count = await target.count();
   }
+  if (count === 0) return { ok: false, reason: 'not_found', candidates: [] };
+  const names = (await target.allInnerTexts()).map(t => t.trim());
+  if (count > 1) return { ok: false, reason: 'ambiguous', candidates: names };
+  return { ok: true, locator: target.first(), name: names[0] || name };
 }
 
-/**
- * Click the "Save and Continue" button on the current page.
- * Returns any validation errors found after submission.
- */
 export async function clickSaveAndContinue(page: Page): Promise<string[]> {
+  const button = page
+    .getByRole('button', { name: /save and continue/i })
+    .or(page.getByRole('button', { name: /^continue$/i }))
+    .or(page.locator('input[type="submit"][value*="Continue" i]'))
+    .first();
   try {
-    const saveButton =
-      page.getByRole('button', { name: /save and continue/i }) ??
-      page.getByRole('button', { name: /continue/i });
-
-    await saveButton.click();
-    await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {});
-    await page.waitForTimeout(500);
+    await button.click({ timeout: 3_000 });
   } catch {
-    try {
-      await page.locator('input[type="submit"][value*="Continue"], button[type="submit"]').first().click();
-      await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {});
-    } catch {
-      return ['Could not find Save and Continue button'];
-    }
+    return ['Could not find Save and Continue button'];
   }
-
-  return await getValidationErrors(page);
+  await waitForPageReady(page);
+  return getValidationErrors(page);
 }
 
-/**
- * Extract validation errors from the current page.
- */
 export async function getValidationErrors(page: Page): Promise<string[]> {
   const errors: string[] = [];
-
-  try {
-    const errorElements = await page.locator('.error, .err, [class*="error"], [role="alert"]').all();
-    for (const el of errorElements) {
-      const text = await el.textContent();
-      if (text?.trim()) {
-        errors.push(text.trim());
-      }
-    }
-  } catch {
-    // No errors found
+  const candidates = page.locator('.error, .err, [class*="error"], [role="alert"]');
+  const count = Math.min(await candidates.count().catch(() => 0), 20);
+  for (let i = 0; i < count; i++) {
+    const el = candidates.nth(i);
+    if (!(await el.isVisible().catch(() => false))) continue;
+    const text = (await el.innerText().catch(() => '')).trim();
+    if (text && !errors.includes(text)) errors.push(text);
   }
-
   return errors;
 }
 
-/**
- * Get the page title from the heading or document title.
- */
 export async function getPageTitle(page: Page): Promise<string> {
-  try {
-    const h1 = await page.locator('h1').first().textContent();
-    if (h1?.trim()) return h1.trim();
-  } catch {
-    // fall through
-  }
-  return await page.title();
+  const h1 = await page.locator('h1').first().innerText({ timeout: 1_000 }).catch(() => '');
+  if (h1.trim()) return h1.trim();
+  return page.title();
 }

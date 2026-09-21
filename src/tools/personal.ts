@@ -1,13 +1,48 @@
-/**
- * Personal info tools: fill_taxpayer_info, fill_filing_status
- */
-
 import { z } from 'zod';
 import { getPage, isSessionExpired, acquirePageLock } from '../browser/context.js';
-import { navigateToSid, waitForPageReady } from '../browser/navigation.js';
-import { fillFieldByLabel, selectByLabel, clickRadioByLabel, getValidationErrors } from '../browser/forms.js';
-import { filterPII } from '../security/pii-filter.js';
-import { FALLBACK_SIDS } from '../types/sections.js';
+import { resolveSid, navigateToSid, assertPage } from '../browser/navigation.js';
+import { setFieldByLabel, getValidationErrors, type FieldResult, type FieldKind } from '../browser/forms.js';
+import { SECTIONS } from '../types/sections.js';
+import { sessionExpiredResult } from './session.js';
+
+// TODO(verify on live site): expected headings for these pages have not been checked against FreeTaxUSA.
+const TAXPAYER_PAGE = /personal|taxpayer|basic info|your info/i;
+const FILING_STATUS_PAGE = /filing status/i;
+
+type NavOutcome = { ok: true } | { ok: false; result: Record<string, unknown> };
+
+async function goToSection(key: keyof typeof SECTIONS, expected: RegExp): Promise<NavOutcome> {
+  const resolved = await resolveSid(key);
+  if (resolved !== null && 'ambiguous' in resolved) {
+    return { ok: false, result: { success: false, error: 'section_ambiguous', candidates: resolved.ambiguous } };
+  }
+  const sid = resolved?.sid ?? SECTIONS[key].fallbackSid;
+  if (sid === undefined) {
+    return { ok: false, result: { success: false, error: 'section_not_found', section: key } };
+  }
+  try {
+    await navigateToSid(sid);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message === 'SESSION_EXPIRED') return { ok: false, result: sessionExpiredResult };
+    return { ok: false, result: { success: false, error: 'navigation_failed', message } };
+  }
+  const check = await assertPage(await getPage(), expected);
+  if (!check.ok) {
+    return { ok: false, result: { success: false, error: 'wrong_page', actualTitle: check.actualTitle, expected: expected.source } };
+  }
+  return { ok: true };
+}
+
+async function firstMatch(labels: string[], value: string, kind: FieldKind = 'auto'): Promise<FieldResult> {
+  const page = await getPage();
+  let last: FieldResult = { ok: false, reason: 'not_found' };
+  for (const label of labels) {
+    last = await setFieldByLabel(page, label, value, kind);
+    if (last.ok || last.reason === 'ambiguous') return last;
+  }
+  return last;
+}
 
 export const fillTaxpayerInfoSchema = z.object({
   firstName: z.string().min(1).describe('First name'),
@@ -30,152 +65,75 @@ export const fillTaxpayerInfoSchema = z.object({
 export async function fillTaxpayerInfo(input: z.infer<typeof fillTaxpayerInfoSchema>): Promise<Record<string, unknown>> {
   const release = await acquirePageLock();
   try {
-    if (await isSessionExpired()) {
-      return { success: false, error: 'session_expired', action: 'Call authenticate to log in.' };
-    }
+    if (await isSessionExpired()) return sessionExpiredResult;
 
-    const page = await getPage();
+    const nav = await goToSection('taxpayer_info', TAXPAYER_PAGE);
+    if (!nav.ok) return nav.result;
 
-    // Navigate to taxpayer info page
-    try {
-      await navigateToSid(FALLBACK_SIDS.taxpayer_info);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg === 'SESSION_EXPIRED') {
-        return { success: false, error: 'session_expired', action: 'Call authenticate to log in.' };
-      }
-    }
+    const results: Record<string, FieldResult> = {
+      firstName: await firstMatch(['First Name'], input.firstName, 'text'),
+      lastName: await firstMatch(['Last Name'], input.lastName, 'text'),
+      ssn: await firstMatch(['SSN', 'Social Security Number', 'Social Security'], input.ssn, 'text'),
+      dob: await firstMatch(['Date of Birth', 'Birth Date', 'DOB'], input.dob, 'text'),
+      occupation: await firstMatch(['Occupation'], input.occupation, 'text'),
+      street: await firstMatch(['Street Address', 'Address'], input.address.street, 'text'),
+      city: await firstMatch(['City'], input.address.city, 'text'),
+      state: await firstMatch(['State'], input.address.state, 'select'),
+      zip: await firstMatch(['ZIP Code', 'Zip', 'ZIP'], input.address.zip, 'text'),
+    };
+    if (input.middleInitial) results.middleInitial = await firstMatch(['Middle Initial', 'M.I.'], input.middleInitial, 'text');
+    if (input.suffix) results.suffix = await firstMatch(['Suffix'], input.suffix, 'select');
+    if (input.address.apt) results.apt = await firstMatch(['Apt', 'Apartment', 'Apt/Unit'], input.address.apt, 'text');
+    if (input.address.zip4) results.zip4 = await firstMatch(['ZIP+4', '+4'], input.address.zip4, 'text');
 
-    await waitForPageReady(page);
-
-    const results: Record<string, boolean> = {};
-
-    // Fill name fields
-    results.firstName = await fillFieldByLabel(page, 'First Name', input.firstName);
-    results.lastName = await fillFieldByLabel(page, 'Last Name', input.lastName);
-
-    if (input.middleInitial) {
-      results.middleInitial = await fillFieldByLabel(page, 'Middle Initial', input.middleInitial);
-    }
-
-    if (input.suffix) {
-      results.suffix = await selectByLabel(page, 'Suffix', input.suffix);
-    }
-
-    // Fill SSN
-    results.ssn = await fillFieldByLabel(page, 'SSN', input.ssn) ||
-                  await fillFieldByLabel(page, 'Social Security', input.ssn);
-
-    // Fill DOB
-    results.dob = await fillFieldByLabel(page, 'Date of Birth', input.dob) ||
-                  await fillFieldByLabel(page, 'DOB', input.dob) ||
-                  await fillFieldByLabel(page, 'Birth', input.dob);
-
-    // Fill occupation
-    results.occupation = await fillFieldByLabel(page, 'Occupation', input.occupation);
-
-    // Fill address
-    results.street = await fillFieldByLabel(page, 'Street Address', input.address.street) ||
-                     await fillFieldByLabel(page, 'Address', input.address.street);
-
-    if (input.address.apt) {
-      results.apt = await fillFieldByLabel(page, 'Apt', input.address.apt) ||
-                    await fillFieldByLabel(page, 'Apartment', input.address.apt);
-    }
-
-    results.city = await fillFieldByLabel(page, 'City', input.address.city);
-    results.state = await selectByLabel(page, 'State', input.address.state);
-    results.zip = await fillFieldByLabel(page, 'Zip', input.address.zip) ||
-                  await fillFieldByLabel(page, 'ZIP', input.address.zip);
-
-    if (input.address.zip4) {
-      results.zip4 = await fillFieldByLabel(page, 'ZIP+4', input.address.zip4) ||
-                     await fillFieldByLabel(page, '+4', input.address.zip4);
-    }
-
-    const errors = await getValidationErrors(page);
-    const allFilled = Object.values(results).every(v => v === true);
-
-    return filterPII({
-      success: allFilled && errors.length === 0,
+    const errors = await getValidationErrors(await getPage());
+    const failed = Object.entries(results).filter(([, r]) => !r.ok).map(([k]) => k);
+    return {
+      success: failed.length === 0 && errors.length === 0,
       filled: results,
+      failed,
       errors: errors.length > 0 ? errors : undefined,
-    });
+      hint: 'Fields set but not yet saved. Call save_and_continue to submit the page.',
+    };
   } finally {
     release();
   }
 }
 
 export const fillFilingStatusSchema = z.object({
-  status: z.enum(['single', 'married_joint', 'married_separate', 'head_of_household', 'qualifying_widow'])
-    .describe('Filing status'),
+  status: z.enum(['single', 'married_joint', 'married_separate', 'head_of_household', 'qualifying_widow']).describe('Filing status'),
 });
 
-const FILING_STATUS_LABELS: Record<string, string> = {
-  'single': 'Single',
-  'married_joint': 'Married filing jointly',
-  'married_separate': 'Married filing separately',
-  'head_of_household': 'Head of household',
-  'qualifying_widow': 'Qualifying surviving spouse',
+const FILING_STATUS_LABELS: Record<z.infer<typeof fillFilingStatusSchema>['status'], string[]> = {
+  single: ['Single'],
+  married_joint: ['Married filing jointly', 'Married Filing Jointly'],
+  married_separate: ['Married filing separately', 'Married Filing Separately'],
+  head_of_household: ['Head of household', 'Head of Household'],
+  qualifying_widow: ['Qualifying surviving spouse', 'Qualifying widow(er)', 'Qualifying widow'],
 };
 
 export async function fillFilingStatus(input: z.infer<typeof fillFilingStatusSchema>): Promise<Record<string, unknown>> {
   const release = await acquirePageLock();
   try {
-    if (await isSessionExpired()) {
-      return { success: false, error: 'session_expired', action: 'Call authenticate to log in.' };
+    if (await isSessionExpired()) return sessionExpiredResult;
+
+    const nav = await goToSection('filing_status', FILING_STATUS_PAGE);
+    if (!nav.ok) return nav.result;
+
+    const labels = FILING_STATUS_LABELS[input.status];
+    const result = await firstMatch(labels, 'true', 'radio');
+    if (!result.ok) {
+      return { success: false, error: 'status_not_found', tried: labels, reason: result.reason, candidates: result.candidates };
     }
 
-    const page = await getPage();
-
-    // Navigate to filing status page (typically SID 12 or close to personal info)
-    try {
-      await navigateToSid(FALLBACK_SIDS.filing_status);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg === 'SESSION_EXPIRED') {
-        return { success: false, error: 'session_expired', action: 'Call authenticate to log in.' };
-      }
-    }
-
-    await waitForPageReady(page);
-
-    const label = FILING_STATUS_LABELS[input.status];
-    const clicked = await clickRadioByLabel(page, label);
-
-    if (!clicked) {
-      // Try shorter labels
-      const shortLabels: Record<string, string[]> = {
-        'single': ['Single'],
-        'married_joint': ['Married filing jointly', 'Married Filing Jointly', 'MFJ'],
-        'married_separate': ['Married filing separately', 'Married Filing Separately', 'MFS'],
-        'head_of_household': ['Head of household', 'Head of Household', 'HOH'],
-        'qualifying_widow': ['Qualifying widow', 'Qualifying surviving spouse', 'QSS'],
-      };
-      let found = false;
-      for (const alt of shortLabels[input.status] ?? []) {
-        if (await clickRadioByLabel(page, alt)) {
-          found = true;
-          break;
-        }
-      }
-      if (!found) {
-        return filterPII({
-          success: false,
-          error: `Could not find radio button for filing status: ${label}`,
-        });
-      }
-    }
-
-    const errors = await getValidationErrors(page);
-
-    return filterPII({
+    const errors = await getValidationErrors(await getPage());
+    return {
       success: errors.length === 0,
-      filled: true,
       filingStatus: input.status,
-      label,
+      matchedLabel: result.matchedLabel,
       errors: errors.length > 0 ? errors : undefined,
-    });
+      hint: 'Status selected but not yet saved. Call save_and_continue to submit the page.',
+    };
   } finally {
     release();
   }

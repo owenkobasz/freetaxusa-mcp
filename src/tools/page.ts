@@ -1,12 +1,10 @@
-/**
- * Page tools: read_current_page, save_and_continue, navigate_section
- */
-
 import { z } from 'zod';
 import { getPage, isSessionExpired, extractSidFromUrl, acquirePageLock } from '../browser/context.js';
 import { readFormFields, clickSaveAndContinue, getPageTitle } from '../browser/forms.js';
-import { resolveSid, navigateToSid, waitForPageReady } from '../browser/navigation.js';
-import { filterPII } from '../security/pii-filter.js';
+import { resolveSid, navigateToSid, discoverSidMap, assertPage } from '../browser/navigation.js';
+import { waitForPageReady } from '../browser/wait.js';
+import { guardPage } from '../security/guards.js';
+import { sessionExpiredResult } from './session.js';
 
 export const readCurrentPageSchema = z.object({});
 
@@ -14,23 +12,15 @@ export async function readCurrentPage(): Promise<Record<string, unknown>> {
   const release = await acquirePageLock();
   try {
     const page = await getPage();
-
-    if (await isSessionExpired()) {
-      return { success: false, error: 'session_expired', action: 'Call authenticate to log in.' };
-    }
-
-    const title = await getPageTitle(page);
+    if (await isSessionExpired()) return sessionExpiredResult;
     const url = page.url();
-    const sid = extractSidFromUrl(url);
-    const fields = await readFormFields(page);
-
-    return filterPII({
+    return {
       success: true,
-      pageTitle: title,
-      sid,
+      pageTitle: await getPageTitle(page),
+      sid: extractSidFromUrl(url),
       url,
-      fields,
-    });
+      fields: await readFormFields(page),
+    };
   } finally {
     release();
   }
@@ -42,79 +32,91 @@ export async function saveAndContinue(): Promise<Record<string, unknown>> {
   const release = await acquirePageLock();
   try {
     const page = await getPage();
+    if (await isSessionExpired()) return sessionExpiredResult;
 
-    if (await isSessionExpired()) {
-      return { success: false, error: 'session_expired', action: 'Call authenticate to log in.' };
+    const guard = await guardPage(page);
+    if (guard.refused) {
+      return { success: false, error: 'refused_filing_page', title: guard.title, message: 'Filing and payment pages must be completed by the user in the browser.' };
     }
 
     const errors = await clickSaveAndContinue(page);
-
     await waitForPageReady(page);
-    const newTitle = await getPageTitle(page);
-    const newUrl = page.url();
-    const newSid = extractSidFromUrl(newUrl);
+    const title = await getPageTitle(page);
+    const sid = extractSidFromUrl(page.url());
 
-    if (errors.length > 0) {
-      return filterPII({
-        success: false,
-        errors,
-        currentPage: newTitle,
-        currentSid: newSid,
-      });
-    }
-
-    return filterPII({
-      success: true,
-      nextPage: newTitle,
-      nextSid: newSid,
-    });
+    if (errors.length > 0) return { success: false, errors, currentPage: title, currentSid: sid };
+    return { success: true, nextPage: title, nextSid: sid };
   } finally {
     release();
   }
 }
 
-export const navigateSectionSchema = z.object({
-  section: z.string().optional().describe('Section name (e.g., "income", "deductions", "personal info")'),
-  sid: z.number().optional().describe('Direct SID number to navigate to'),
-}).refine(data => data.section || data.sid !== undefined, {
-  message: 'Either section name or sid must be provided',
-});
+export const navigateSectionSchema = z
+  .object({
+    section: z.string().optional().describe('Section name (e.g., "income", "deductions", "personal info")'),
+    sid: z.number().optional().describe('Direct SID number to navigate to'),
+  })
+  .refine(data => data.section !== undefined || data.sid !== undefined, {
+    message: 'Either section name or sid must be provided',
+  });
 
-export async function navigateSection(input: { section?: string; sid?: number }): Promise<Record<string, unknown>> {
+export async function navigateSection(input: z.infer<typeof navigateSectionSchema>): Promise<Record<string, unknown>> {
   const release = await acquirePageLock();
   try {
-    if (await isSessionExpired()) {
-      return { success: false, error: 'session_expired', action: 'Call authenticate to log in.' };
-    }
+    if (await isSessionExpired()) return sessionExpiredResult;
 
-    const targetSid = await resolveSid(input.section, input.sid);
-    if (targetSid === null) {
-      return {
-        success: false,
-        error: 'section_not_found',
-        message: `Could not resolve section "${input.section}" to a SID. Try using a direct SID number.`,
-      };
+    const resolved = await resolveSid(input.section, input.sid);
+    if (resolved === null) {
+      return { success: false, error: 'section_not_found', message: `Could not resolve section "${input.section}". Call list_sections to see available names.` };
+    }
+    if ('ambiguous' in resolved) {
+      return { success: false, error: 'section_ambiguous', candidates: resolved.ambiguous };
     }
 
     try {
-      const result = await navigateToSid(targetSid);
-      return filterPII({
-        success: true,
-        navigated: true,
-        currentPage: result.title,
-        sid: result.sid,
-        url: result.url,
-      });
+      const result = await navigateToSid(resolved.sid);
+      return { success: true, currentPage: result.title, sid: result.sid, url: result.url };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      if (message === 'SESSION_EXPIRED') {
-        return { success: false, error: 'session_expired', action: 'Call authenticate to log in.' };
-      }
-      if (message.startsWith('STATE_PAYWALL')) {
-        return { success: false, error: 'state_paywall', message };
-      }
-      return filterPII({ success: false, error: 'navigation_failed', message });
+      if (message === 'SESSION_EXPIRED') return sessionExpiredResult;
+      return { success: false, error: 'navigation_failed', message };
     }
+  } finally {
+    release();
+  }
+}
+
+export const expectPageSchema = z.object({
+  titleContains: z.string().min(1).describe('Text the page heading or title must contain (case-insensitive)'),
+});
+
+export async function expectPage(input: z.infer<typeof expectPageSchema>): Promise<Record<string, unknown>> {
+  const release = await acquirePageLock();
+  try {
+    const page = await getPage();
+    if (await isSessionExpired()) return sessionExpiredResult;
+    const result = await assertPage(page, input.titleContains);
+    return { success: true, ok: result.ok, actualTitle: result.actualTitle, sid: extractSidFromUrl(page.url()) };
+  } finally {
+    release();
+  }
+}
+
+export const listSectionsSchema = z.object({
+  refresh: z.boolean().optional().describe('Re-scan the sidebar instead of using the cached map'),
+});
+
+export async function listSections(input: z.infer<typeof listSectionsSchema>): Promise<Record<string, unknown>> {
+  const release = await acquirePageLock();
+  try {
+    const page = await getPage();
+    if (await isSessionExpired()) return sessionExpiredResult;
+    const before = Date.now();
+    const map = await discoverSidMap(page, input.refresh ?? false);
+    const sections = Array.from(map.bySid.entries())
+      .map(([sid, name]) => ({ sid, name }))
+      .sort((a, b) => a.sid - b.sid);
+    return { success: true, sections, discoveredAt: new Date(map.discoveredAt).toISOString(), fromCache: map.discoveredAt < before };
   } finally {
     release();
   }

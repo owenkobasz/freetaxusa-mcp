@@ -1,155 +1,66 @@
-/**
- * SID-based navigation and dynamic SID discovery.
- */
-
 import { type Page } from 'playwright';
 import { getPage, BASE_URL, extractSidFromUrl, isSessionExpired } from './context.js';
-import { SidMap, FALLBACK_SIDS, normalizeSectionName } from '../types/sections.js';
+import { getPageTitle } from './forms.js';
+import { waitForPageReady } from './wait.js';
+import { type SidMap, type SidResolution, resolveSidFromMap } from '../types/sections.js';
 
 let cachedSidMap: SidMap | null = null;
+const SID_CACHE_TTL_MS = 300_000;
 
-/**
- * Discover SID mappings from the navigation sidebar on the current page.
- * Scrapes links that contain ?sid=N patterns.
- */
-export async function discoverSidMap(page: Page): Promise<SidMap> {
-  if (cachedSidMap && Date.now() - cachedSidMap.discoveredAt < 300_000) {
+export async function discoverSidMap(page: Page, force = false): Promise<SidMap> {
+  if (!force && cachedSidMap && Date.now() - cachedSidMap.discoveredAt < SID_CACHE_TTL_MS) {
     return cachedSidMap;
   }
 
-  const sections = new Map<string, { name: string; sid: number; tab: string }>();
   const byName = new Map<string, number>();
   const bySid = new Map<number, string>();
 
-  try {
-    const links = await page.evaluate(() => {
-      const results: Array<{ text: string; href: string }> = [];
-      const anchors = document.querySelectorAll('a[href*="sid="]');
-      anchors.forEach(a => {
-        const text = (a as HTMLAnchorElement).textContent?.trim() ?? '';
-        const href = (a as HTMLAnchorElement).getAttribute('href') ?? '';
-        if (text && href) {
-          results.push({ text, href });
-        }
-      });
-      return results;
-    });
+  const links = await page
+    .evaluate(() =>
+      Array.from(document.querySelectorAll<HTMLAnchorElement>('a[href*="sid="]')).map(a => ({
+        text: a.textContent?.trim() ?? '',
+        href: a.getAttribute('href') ?? '',
+      })),
+    )
+    .catch(() => []);
 
-    for (const link of links) {
-      const sidMatch = link.href.match(/sid=(\d+)/);
-      if (!sidMatch) continue;
-      const sid = parseInt(sidMatch[1], 10);
-      const name = link.text;
-      const tab = categorizeSid(sid);
-
-      const info = { name, sid, tab };
-      sections.set(name.toLowerCase(), info);
-      byName.set(name.toLowerCase(), sid);
-      bySid.set(sid, name);
-    }
-  } catch {
-    // Fall back to static map if discovery fails
+  for (const link of links) {
+    const match = link.href.match(/sid=(\d+)/);
+    if (!match || !link.text) continue;
+    const sid = parseInt(match[1], 10);
+    byName.set(link.text.toLowerCase(), sid);
+    if (!bySid.has(sid)) bySid.set(sid, link.text);
   }
 
-  cachedSidMap = { sections, byName, bySid, discoveredAt: Date.now() };
+  cachedSidMap = { byName, bySid, discoveredAt: Date.now() };
   return cachedSidMap;
 }
 
-function categorizeSid(sid: number): string {
-  if (sid <= 10) return 'Start';
-  if (sid <= 19) return 'Personal Information';
-  if (sid <= 49) return 'Income';
-  if (sid <= 79) return 'Deductions & Credits';
-  if (sid <= 89) return 'Miscellaneous';
-  if (sid <= 94) return 'Summary';
-  if (sid <= 98) return 'State';
-  return 'Filing';
+export async function countSidLinks(page: Page): Promise<number> {
+  return page.locator('a[href*="sid="]').count().catch(() => 0);
 }
 
-/**
- * Resolve a section name or SID to a concrete SID number.
- */
-export async function resolveSid(section?: string, sid?: number): Promise<number | null> {
-  if (sid !== undefined) return sid;
+export async function resolveSid(section?: string, sid?: number): Promise<SidResolution> {
+  if (sid !== undefined) return { sid };
   if (!section) return null;
-
-  const page = await getPage();
-  const sidMap = await discoverSidMap(page);
-
-  // Try exact match first
-  const lower = section.toLowerCase().trim();
-  const found = sidMap.byName.get(lower);
-  if (found !== undefined) return found;
-
-  // Try normalized alias match
-  const normalized = normalizeSectionName(section);
-  if (normalized && FALLBACK_SIDS[normalized] !== undefined) {
-    return FALLBACK_SIDS[normalized];
-  }
-
-  // Try partial match against discovered sections
-  for (const [name, s] of sidMap.byName) {
-    if (name.includes(lower) || lower.includes(name)) {
-      return s;
-    }
-  }
-
-  return null;
+  const map = await discoverSidMap(await getPage());
+  return resolveSidFromMap(map, section);
 }
 
-/**
- * Navigate to a specific SID page.
- * Returns the page title and actual SID after navigation.
- */
 export async function navigateToSid(sid: number): Promise<{ title: string; sid: number; url: string }> {
   const page = await getPage();
-  const url = `${BASE_URL}?sid=${sid}`;
-
-  await page.goto(url, { waitUntil: 'networkidle', timeout: 15_000 });
-
-  // Check for session expiry after navigation
-  if (await isSessionExpired()) {
-    throw new Error('SESSION_EXPIRED');
-  }
-
-  // Check for state filing paywall
-  const pageContent = await page.textContent('body');
-  if (pageContent && (pageContent.includes('State Return') && pageContent.includes('$15.99'))) {
-    throw new Error('STATE_PAYWALL: Navigation would trigger the $15.99 state filing purchase. Confirm before proceeding.');
-  }
-
-  const title = await page.title();
-  const actualSid = extractSidFromUrl(page.url()) ?? sid;
-
-  return { title, sid: actualSid, url: page.url() };
+  await page.goto(`${BASE_URL}?sid=${sid}`, { waitUntil: 'domcontentloaded', timeout: 15_000 });
+  await waitForPageReady(page);
+  if (await isSessionExpired()) throw new Error('SESSION_EXPIRED');
+  return { title: await getPageTitle(page), sid: extractSidFromUrl(page.url()) ?? sid, url: page.url() };
 }
 
-/**
- * Wait for the page to be fully loaded and stable.
- */
-export async function waitForPageReady(page: Page): Promise<void> {
-  await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {
-    // Fallback: just wait for DOM
-  });
-  // Brief pause for any JS rendering
-  await page.waitForTimeout(500);
+export async function assertPage(page: Page, expected: RegExp | string): Promise<{ ok: boolean; actualTitle: string }> {
+  const actualTitle = await getPageTitle(page);
+  const ok = typeof expected === 'string' ? actualTitle.toLowerCase().includes(expected.toLowerCase()) : expected.test(actualTitle);
+  return { ok, actualTitle };
 }
 
-/**
- * Detect and handle unsaved changes dialog.
- */
-export async function handleUnsavedChangesDialog(page: Page): Promise<void> {
-  page.on('dialog', async dialog => {
-    if (dialog.message().toLowerCase().includes('unsaved') ||
-        dialog.message().toLowerCase().includes('leave')) {
-      await dialog.accept();
-    }
-  });
-}
-
-/**
- * Clear the cached SID map (for testing or after session change).
- */
 export function clearSidMapCache(): void {
   cachedSidMap = null;
 }

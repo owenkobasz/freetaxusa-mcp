@@ -1,90 +1,57 @@
-/**
- * Overview tools: get_tax_summary, get_refund_estimate
- */
-
 import { z } from 'zod';
-import { getPage, isSessionExpired, acquirePageLock, extractSidFromUrl } from '../browser/context.js';
-import { navigateToSid, waitForPageReady, discoverSidMap } from '../browser/navigation.js';
-import { filterPII } from '../security/pii-filter.js';
-import { FALLBACK_SIDS } from '../types/sections.js';
+import { getPage, isSessionExpired, acquirePageLock } from '../browser/context.js';
+import { resolveSid, navigateToSid, assertPage } from '../browser/navigation.js';
+import { SECTIONS } from '../types/sections.js';
+import { sessionExpiredResult } from './session.js';
 
-export const getTaxSummarySchema = z.object({});
+// TODO(verify on live site): sidebar and summary-table markup have not been checked against FreeTaxUSA.
+const SUMMARY_PAGE = /summary|overview|review/i;
 
-export async function getTaxSummary(): Promise<Record<string, unknown>> {
-  const release = await acquirePageLock();
-  try {
-    if (await isSessionExpired()) {
-      return { success: false, error: 'session_expired', action: 'Call authenticate to log in.' };
-    }
+interface LabeledAmounts {
+  federalRefund: number | null;
+  federalOwed: number | null;
+  stateRefund: number | null;
+  stateOwed: number | null;
+}
 
-    const page = await getPage();
+function parseAmount(text: string | null | undefined): number | null {
+  if (!text) return null;
+  const match = text.replace(/,/g, '').match(/-?\$?\s*(\d+(?:\.\d{1,2})?)/);
+  return match ? parseFloat(match[1]) : null;
+}
 
-    // Navigate to summary page
-    try {
-      await navigateToSid(FALLBACK_SIDS.summary);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg === 'SESSION_EXPIRED') {
-        return { success: false, error: 'session_expired', action: 'Call authenticate to log in.' };
+async function readLabeledAmounts(): Promise<LabeledAmounts> {
+  const page = await getPage();
+  const pairs = await page.evaluate(() => {
+    const out: Array<{ label: string; text: string }> = [];
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+    let node = walker.nextNode();
+    while (node) {
+      const el = node as HTMLElement;
+      const own = Array.from(el.childNodes)
+        .filter(n => n.nodeType === Node.TEXT_NODE)
+        .map(n => n.textContent?.trim() ?? '')
+        .join(' ')
+        .trim();
+      if (own.length > 0 && own.length < 60 && /\b(federal|state)\b/i.test(own) && /\b(refund|due|owe|owed|balance)\b/i.test(own)) {
+        const container = el.closest('tr, li, div, p, dl') ?? el;
+        out.push({ label: own, text: (container.textContent ?? '').trim().slice(0, 200) });
       }
+      node = walker.nextNode();
     }
+    return out;
+  });
 
-    await waitForPageReady(page);
-
-    // Extract summary data from the page
-    const summary = await page.evaluate(() => {
-      const getText = (selectors: string[]): string | null => {
-        for (const sel of selectors) {
-          const el = document.querySelector(sel);
-          if (el?.textContent?.trim()) return el.textContent.trim();
-        }
-        return null;
-      };
-
-      const body = document.body.textContent ?? '';
-
-      // Look for refund/owed amounts
-      const refundMatch = body.match(/(?:refund|Refund)[:\s]*\$?([\d,]+\.?\d*)/);
-      const owedMatch = body.match(/(?:owe|Owe|amount due|Amount Due)[:\s]*\$?([\d,]+\.?\d*)/);
-      const agiMatch = body.match(/(?:AGI|adjusted gross income)[:\s]*\$?([\d,]+\.?\d*)/i);
-      const statusMatch = body.match(/(?:filing status|Filing Status)[:\s]*(Single|Married|Head of Household|Qualifying)/i);
-
-      // Look for completed sections
-      const completedSections: string[] = [];
-      const checkmarks = document.querySelectorAll('.complete, .completed, [class*="check"], .done');
-      checkmarks.forEach(el => {
-        const text = el.closest('tr, li, div')?.textContent?.trim();
-        if (text) completedSections.push(text);
-      });
-
-      return {
-        refundAmount: refundMatch ? refundMatch[1] : null,
-        owedAmount: owedMatch ? owedMatch[1] : null,
-        agi: agiMatch ? agiMatch[1] : null,
-        filingStatus: statusMatch ? statusMatch[1] : null,
-        completedSections,
-      };
-    });
-
-    const amount = summary.refundAmount
-      ? parseFloat(summary.refundAmount.replace(/,/g, ''))
-      : summary.owedAmount
-        ? parseFloat(summary.owedAmount.replace(/,/g, ''))
-        : null;
-
-    const refundOrOwed = summary.refundAmount ? 'refund' : summary.owedAmount ? 'owed' : 'unknown';
-
-    return filterPII({
-      success: true,
-      refundOrOwed,
-      amount,
-      agi: summary.agi ? parseFloat(summary.agi.replace(/,/g, '')) : null,
-      filingStatus: summary.filingStatus,
-      sectionsComplete: summary.completedSections,
-    });
-  } finally {
-    release();
+  const amounts: LabeledAmounts = { federalRefund: null, federalOwed: null, stateRefund: null, stateOwed: null };
+  for (const { label, text } of pairs) {
+    const isState = /\bstate\b/i.test(label);
+    const isOwed = /\b(due|owe|owed|balance)\b/i.test(label);
+    const amount = parseAmount(text.replace(label, ''));
+    if (amount === null) continue;
+    const key: keyof LabeledAmounts = isState ? (isOwed ? 'stateOwed' : 'stateRefund') : isOwed ? 'federalOwed' : 'federalRefund';
+    if (amounts[key] === null) amounts[key] = amount;
   }
+  return amounts;
 }
 
 export const getRefundEstimateSchema = z.object({});
@@ -92,40 +59,61 @@ export const getRefundEstimateSchema = z.object({});
 export async function getRefundEstimate(): Promise<Record<string, unknown>> {
   const release = await acquirePageLock();
   try {
-    if (await isSessionExpired()) {
-      return { success: false, error: 'session_expired', action: 'Call authenticate to log in.' };
+    if (await isSessionExpired()) return sessionExpiredResult;
+    const amounts = await readLabeledAmounts();
+    return { success: true, source: 'sidebar', ...amounts, note: 'Confirm against the browser window before relying on these figures.' };
+  } finally {
+    release();
+  }
+}
+
+export const getTaxSummarySchema = z.object({});
+
+export async function getTaxSummary(): Promise<Record<string, unknown>> {
+  const release = await acquirePageLock();
+  try {
+    if (await isSessionExpired()) return sessionExpiredResult;
+
+    const resolved = await resolveSid('summary');
+    if (resolved !== null && 'ambiguous' in resolved) {
+      return { success: false, error: 'section_ambiguous', candidates: resolved.ambiguous };
+    }
+    try {
+      await navigateToSid(resolved?.sid ?? SECTIONS.summary.fallbackSid!);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message === 'SESSION_EXPIRED') return sessionExpiredResult;
+      return { success: false, error: 'navigation_failed', message };
     }
 
     const page = await getPage();
+    const check = await assertPage(page, SUMMARY_PAGE);
+    if (!check.ok) return { success: false, error: 'wrong_page', actualTitle: check.actualTitle, expected: SUMMARY_PAGE.source };
 
-    // Try to read the refund estimate from the current page sidebar first
-    // FreeTaxUSA often shows a running estimate in the sidebar
-    const estimate = await page.evaluate(() => {
-      const body = document.body.textContent ?? '';
+    const rows = await page.evaluate(() =>
+      Array.from(document.querySelectorAll('tr, dl > div, li'))
+        .map(row => {
+          const cells = Array.from(row.querySelectorAll('td, th, dt, dd, span, div')).map(c => (c.textContent ?? '').trim()).filter(Boolean);
+          return cells.length >= 2 ? { label: cells[0], value: cells[cells.length - 1] } : null;
+        })
+        .filter((r): r is { label: string; value: string } => r !== null),
+    );
 
-      const federalRefundMatch = body.match(/(?:Federal\s+)?(?:Refund|refund)[:\s]*\$?([\d,]+\.?\d*)/i);
-      const federalOwedMatch = body.match(/(?:Federal\s+)?(?:Amount\s+(?:Due|Owed)|owe)[:\s]*\$?([\d,]+\.?\d*)/i);
-      const stateRefundMatch = body.match(/(?:State\s+)?(?:Refund|refund)[:\s]*\$?([\d,]+\.?\d*)/i);
-      const stateOwedMatch = body.match(/(?:State\s+)?(?:Amount\s+(?:Due|Owed))[:\s]*\$?([\d,]+\.?\d*)/i);
+    const find = (pattern: RegExp): string | null => rows.find(r => pattern.test(r.label))?.value ?? null;
+    const agi = parseAmount(find(/adjusted gross income|\bAGI\b/i));
+    const refund = parseAmount(find(/refund/i));
+    const owed = parseAmount(find(/amount (due|owed)|balance due|you owe/i));
+    const filingStatus = find(/filing status/i);
 
-      return {
-        federalRefund: federalRefundMatch ? federalRefundMatch[1] : null,
-        federalOwed: federalOwedMatch ? federalOwedMatch[1] : null,
-        stateRefund: stateRefundMatch ? stateRefundMatch[1] : null,
-        stateOwed: stateOwedMatch ? stateOwedMatch[1] : null,
-      };
-    });
-
-    const parseAmount = (val: string | null): number | undefined =>
-      val ? parseFloat(val.replace(/,/g, '')) : undefined;
-
-    return filterPII({
+    return {
       success: true,
-      federalRefund: parseAmount(estimate.federalRefund),
-      federalOwed: parseAmount(estimate.federalOwed),
-      stateRefund: parseAmount(estimate.stateRefund),
-      stateOwed: parseAmount(estimate.stateOwed),
-    });
+      source: 'summary_table',
+      refundOrOwed: refund !== null ? 'refund' : owed !== null ? 'owed' : 'unknown',
+      amount: refund ?? owed,
+      agi,
+      filingStatus,
+      note: 'Confirm against the browser window before relying on these figures.',
+    };
   } finally {
     release();
   }

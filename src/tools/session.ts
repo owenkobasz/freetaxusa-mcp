@@ -1,134 +1,94 @@
-/**
- * Session tools: authenticate, get_session_status
- */
-
 import { z } from 'zod';
-import { getPage, isSessionExpired, extractSidFromUrl, AUTH_URL, BASE_URL, acquirePageLock, seedSessionFromHermes } from '../browser/context.js';
-import { discoverSidMap, waitForPageReady } from '../browser/navigation.js';
-import { filterPII } from '../security/pii-filter.js';
-import type { SessionStatus } from '../types/tax.js';
+import { rmSync } from 'node:fs';
+import {
+  getPage,
+  isSessionExpired,
+  extractSidFromUrl,
+  AUTH_URL,
+  AUTH_HOST,
+  BASE_URL,
+  acquirePageLock,
+  isHeadless,
+  closeBrowser,
+  getUserDataDir,
+} from '../browser/context.js';
+import { discoverSidMap, countSidLinks, clearSidMapCache } from '../browser/navigation.js';
+import { waitForPageReady } from '../browser/wait.js';
 import { getPageTitle } from '../browser/forms.js';
+import type { SessionStatus } from '../types/tax.js';
 
-export const authenticateSchema = z.object({
-  email: z.string().email().optional().describe('FreeTaxUSA account email (not required when Hermes brokers the login)'),
-  password: z.string().min(1).optional().describe('FreeTaxUSA account password (not required when Hermes brokers the login)'),
-  mfaCode: z.string().optional().describe('MFA code if prompted'),
-});
+const LOGIN_POLL_MS = 2_000;
+const LOGIN_WAIT_MS = 90_000;
+const LOGIN_ACTION = 'Call login_manual to sign in.';
 
-export async function authenticate(input: z.infer<typeof authenticateSchema>): Promise<Record<string, unknown>> {
+export const sessionExpiredResult = { success: false, error: 'session_expired', action: LOGIN_ACTION };
+
+function taxYear(): string {
+  return process.env.FREETAXUSA_TAX_YEAR ?? '2025';
+}
+
+async function hasLiveSession(): Promise<boolean> {
+  const page = await getPage();
+  if (page.url().includes(AUTH_HOST)) return false;
+  return (await countSidLinks(page)) > 0;
+}
+
+export const loginManualSchema = z.object({});
+
+export async function loginManual(): Promise<Record<string, unknown>> {
+  if (isHeadless()) {
+    return {
+      success: false,
+      error: 'headless_not_supported',
+      message: 'Manual login needs a visible browser. Start the server with FREETAXUSA_HEADLESS=false.',
+    };
+  }
+
   const release = await acquirePageLock();
   try {
     const page = await getPage();
+    await page.goto(BASE_URL, { waitUntil: 'domcontentloaded', timeout: 20_000 }).catch(() => undefined);
+    await waitForPageReady(page);
 
-    // Hermes is the AUTHORITATIVE auth path when configured. Try it before any
-    // embedded Playwright login. If it seeds a session, verify it landed and
-    // return — no email/password needed. If Hermes is not configured (or is
-    // configured-but-down with FREETAXUSA_LEGACY_AUTH=true), fall through to the
-    // embedded login below. If configured-but-down without the legacy flag,
-    // seedSessionFromHermes() throws (fail loud).
-    const hermesOutcome = await seedSessionFromHermes();
-    if (hermesOutcome === 'seeded') {
-      await page.goto(BASE_URL, { waitUntil: 'networkidle', timeout: 20_000 }).catch(() => {});
-      await waitForPageReady(page);
-      const landedUrl = page.url();
-      const hermesAuthenticated = landedUrl.includes('freetaxusa.com') && !landedUrl.includes('auth.freetaxusa.com');
-      const taxYearHermes = process.env.FREETAXUSA_TAX_YEAR ?? '2025';
+    if (await hasLiveSession()) {
+      await discoverSidMap(page, true);
+      const landingUrl = page.url();
+      return {
+        success: true,
+        authenticated: true,
+        reason: 'already_authenticated',
+        taxYear: taxYear(),
+        landingUrl,
+        urlMatchesBase: landingUrl.startsWith(BASE_URL),
+      };
+    }
 
-      if (hermesAuthenticated) {
-        await discoverSidMap(page);
-        return filterPII({
+    if (!page.url().includes(AUTH_HOST)) {
+      await page.goto(AUTH_URL, { waitUntil: 'domcontentloaded', timeout: 20_000 }).catch(() => undefined);
+    }
+
+    const deadline = Date.now() + LOGIN_WAIT_MS;
+    while (Date.now() < deadline) {
+      await page.waitForTimeout(LOGIN_POLL_MS);
+      if (await hasLiveSession()) {
+        await discoverSidMap(page, true);
+        const landingUrl = page.url();
+        return {
+          success: true,
           authenticated: true,
-          authSource: 'hermes',
-          taxYear: taxYearHermes,
-          currentUrl: landedUrl,
-          message: 'Authenticated via Hermes-brokered session.',
-        });
+          taxYear: taxYear(),
+          landingUrl,
+          urlMatchesBase: landingUrl.startsWith(BASE_URL),
+        };
       }
-
-      // Cookies were injected but the site still bounced us to login — the
-      // brokered session is stale/invalid. Do NOT silently retry with embedded
-      // login: that defeats Hermes ownership. Surface it so the operator
-      // refreshes the Hermes-side credential.
-      return filterPII({
-        authenticated: false,
-        authSource: 'hermes',
-        taxYear: taxYearHermes,
-        currentUrl: landedUrl,
-        message:
-          'Hermes provided a session but FreeTaxUSA still requires login (stale/invalid brokered cookies). ' +
-          'Refresh the freetaxusa cookie-session credential in Hermes. ' +
-          '(Set FREETAXUSA_LEGACY_AUTH=true to allow the embedded Playwright login fallback.)',
-      });
     }
 
-    // Embedded Playwright login path: Hermes not configured, or configured-but-down
-    // with FREETAXUSA_LEGACY_AUTH=true. Requires email + password.
-    if (!input.email || !input.password) {
-      return filterPII({
-        authenticated: false,
-        error: 'credentials_required',
-        message:
-          'email and password are required for the embedded login. ' +
-          'Configure Hermes (HERMES_URL/HERMES_CLIENT_TOKEN) to broker the login instead.',
-      });
-    }
-
-    await page.goto(AUTH_URL, { waitUntil: 'networkidle', timeout: 20_000 });
-    await waitForPageReady(page);
-
-    // Fill login form
-    const emailField = page.getByLabel(/email/i).or(page.locator('input[type="email"], input[name*="email"], input[name*="user"]')).first();
-    await emailField.fill(input.email);
-
-    const passwordField = page.getByLabel(/password/i).or(page.locator('input[type="password"]')).first();
-    await passwordField.fill(input.password);
-
-    // Click sign in
-    const signInButton = page.getByRole('button', { name: /sign in|log in|continue/i }).first();
-    await signInButton.click();
-
-    await page.waitForLoadState('networkidle', { timeout: 15_000 }).catch(() => {});
-    await waitForPageReady(page);
-
-    // Handle MFA if prompted
-    const currentUrl = page.url();
-    if (currentUrl.includes('mfa') || currentUrl.includes('verify') || currentUrl.includes('2fa')) {
-      if (!input.mfaCode) {
-        return filterPII({
-          authenticated: false,
-          mfaRequired: true,
-          message: 'MFA code required. Call authenticate again with the mfaCode parameter.',
-        });
-      }
-
-      const mfaField = page.getByLabel(/code|verification/i).or(page.locator('input[name*="code"], input[name*="mfa"]')).first();
-      await mfaField.fill(input.mfaCode);
-
-      const verifyButton = page.getByRole('button', { name: /verify|submit|continue/i }).first();
-      await verifyButton.click();
-
-      await page.waitForLoadState('networkidle', { timeout: 15_000 }).catch(() => {});
-      await waitForPageReady(page);
-    }
-
-    // Check if we landed on the tax app
-    const finalUrl = page.url();
-    const authenticated = finalUrl.includes('freetaxusa.com') && !finalUrl.includes('auth.freetaxusa.com');
-
-    if (authenticated) {
-      // Trigger SID discovery
-      await discoverSidMap(page);
-    }
-
-    const taxYear = process.env.FREETAXUSA_TAX_YEAR ?? '2025';
-
-    return filterPII({
-      authenticated,
-      authSource: 'embedded',
-      taxYear,
-      currentUrl: finalUrl,
-      message: authenticated ? 'Successfully authenticated.' : 'Authentication failed. Check credentials.',
-    });
+    return {
+      success: false,
+      authenticated: false,
+      status: 'waiting_for_user',
+      message: 'Finish signing in in the browser window, then call login_manual again.',
+    };
   } finally {
     release();
   }
@@ -140,34 +100,64 @@ export async function getSessionStatus(): Promise<Record<string, unknown>> {
   const release = await acquirePageLock();
   try {
     const page = await getPage();
-    const url = page.url();
-    const expired = await isSessionExpired();
-
-    if (expired || url === 'about:blank') {
-      return filterPII({
-        active: false,
-        taxYear: null,
-        currentSection: null,
-        currentSid: null,
-        message: 'No active session. Call authenticate first.',
-      } satisfies SessionStatus & { message: string });
+    if (await isSessionExpired()) {
+      const status: SessionStatus = { active: false, taxYear: null, currentSection: null, currentSid: null };
+      return { ...status, message: 'No active session. ' + LOGIN_ACTION };
     }
 
-    const sid = extractSidFromUrl(url);
-    const title = await getPageTitle(page);
-
-    // Try to get section name from SID map
+    const sid = extractSidFromUrl(page.url());
     const sidMap = await discoverSidMap(page);
-    const sectionName = sid !== null ? (sidMap.bySid.get(sid) ?? null) : null;
-
-    const taxYear = process.env.FREETAXUSA_TAX_YEAR ?? '2025';
-
-    return filterPII({
+    const status: SessionStatus = {
       active: true,
-      taxYear,
-      currentSection: sectionName ?? title,
+      taxYear: taxYear(),
+      currentSection: (sid !== null ? sidMap.bySid.get(sid) : undefined) ?? (await getPageTitle(page)),
       currentSid: sid,
-    } satisfies SessionStatus);
+    };
+    return { ...status };
+  } finally {
+    release();
+  }
+}
+
+export const logoutSchema = z.object({
+  wipeProfile: z.boolean().optional().describe('Delete the saved browser profile and cookies. Defaults to true.'),
+});
+
+export async function logout(input: z.infer<typeof logoutSchema>): Promise<Record<string, unknown>> {
+  const wipeProfile = input.wipeProfile ?? true;
+  const release = await acquirePageLock();
+  try {
+    let loggedOut = false;
+    const page = await getPage();
+    if (!(await isSessionExpired())) {
+      const signOut = page
+        .getByRole('link', { name: /sign out|log out|logout/i })
+        .or(page.getByRole('button', { name: /sign out|log out|logout/i }))
+        .first();
+      loggedOut = await signOut
+        .click({ timeout: 3_000 })
+        .then(() => true)
+        .catch(() => false);
+      if (loggedOut) await waitForPageReady(page);
+    }
+
+    await closeBrowser();
+    clearSidMapCache();
+
+    let profileDeleted = false;
+    if (wipeProfile) {
+      const dir = getUserDataDir();
+      try {
+        rmSync(dir, { recursive: true, force: true });
+        profileDeleted = true;
+      } catch {
+        await new Promise(r => setTimeout(r, 1_000));
+        rmSync(dir, { recursive: true, force: true });
+        profileDeleted = true;
+      }
+    }
+
+    return { success: true, loggedOut, profileDeleted };
   } finally {
     release();
   }
