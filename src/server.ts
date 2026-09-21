@@ -13,6 +13,7 @@ import { fillW2IncomeSchema, fillW2Income, fill1099IncomeSchema, fill1099Income 
 import { fillDeductionsSchema, fillDeductions } from './tools/deductions.js';
 import { reviewReturnSchema, reviewReturn } from './tools/review.js';
 import { fileExtensionSchema, fileExtension, getFormStatusSchema, getFormStatus } from './tools/filing.js';
+import { fillFieldsSchema, fillFields, clickButtonSchema, clickButton } from './tools/generic.js';
 import { filterPII } from './security/pii-filter.js';
 
 export function createServer(): McpServer {
@@ -87,6 +88,21 @@ export function createServer(): McpServer {
       sid: z.number().optional().describe('Direct SID number to navigate to'),
     },
     wrapHandler(args => navigateSection(args as { section?: string; sid?: number })),
+  );
+
+  // Generic page tools: fill any form by accessible label
+  server.tool(
+    'fill_fields',
+    'Fill one or more fields on the current page by their accessible label (from read_current_page). Works on any page: W-2, 1099, deductions, etc. Does not save; call save_and_continue afterward.',
+    fillFieldsSchema.shape,
+    wrapHandler(args => fillFields(fillFieldsSchema.parse(args))),
+  );
+
+  server.tool(
+    'click_button',
+    'Click a button or link on the current page by its text (e.g. "Add a W-2", "Edit"). Refuses filing and purchase actions.',
+    clickButtonSchema.shape,
+    wrapHandler(args => clickButton(clickButtonSchema.parse(args))),
   );
 
   // Phase 1: Personal info tools

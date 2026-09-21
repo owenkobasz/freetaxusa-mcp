@@ -30,7 +30,7 @@ You: "Here's my W-2, help me file"
 
 ## Features
 
-- **15 tax filing tools** across personal info, income, deductions, review, and filing
+- **17 tax filing tools** across personal info, income, deductions, review, and filing
 - **Session persistence** -- login once, cookies survive between invocations
 - **PII protection** -- SSNs, account numbers, and EINs are automatically redacted from all tool outputs
 - **Dynamic navigation** -- discovers FreeTaxUSA's section structure at runtime
@@ -54,6 +54,8 @@ You: "Here's my W-2, help me file"
 | `read_current_page` | Read all form fields and their current values on the active page. |
 | `save_and_continue` | Submit the current page and advance to the next. |
 | `navigate_section` | Jump to a section by name ("income", "deductions") or SID number. |
+| `fill_fields` | Fill any fields on the current page by accessible label. Works on every page (W-2, 1099, deductions). Does not save. |
+| `click_button` | Click a button or link by text ("Add a W-2", "Edit"). Refuses filing and purchase actions. |
 
 ### Personal Information
 
@@ -85,7 +87,7 @@ You: "Here's my W-2, help me file"
 | `file_extension` | File Form 4868 for an automatic 6-month extension. |
 | `get_form_status` | Get which sections are complete, incomplete, or have errors. |
 
-> Phase 2 and 3 tools are stubbed and will be implemented in upcoming releases.
+> Phase 2 and 3 tools are stubbed. Use `read_current_page` + `fill_fields` + `save_and_continue` to work any income or deduction page today.
 
 ## Quick Start
 
