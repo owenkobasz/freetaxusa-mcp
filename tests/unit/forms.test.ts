@@ -110,6 +110,21 @@ describe('setFieldByLabel', () => {
     expect(await page.isChecked('#cb')).toBe(true);
   });
 
+  it('selects a radio option by the group question and option text', async () => {
+    const result = await setFieldByLabel(page, 'What is your filing status?', 'Married filing jointly');
+    expect(result.ok).toBe(true);
+    expect(result.via).toBe('radio');
+    expect(await page.isChecked('input[value="m"]')).toBe(true);
+
+    const explicit = await setFieldByLabel(page, 'filing status', 'Single', 'radio');
+    expect(explicit.ok).toBe(true);
+    expect(await page.isChecked('input[value="s"]')).toBe(true);
+
+    const miss = await setFieldByLabel(page, 'What is your filing status?', 'Head of household', 'radio');
+    expect(miss.ok).toBe(false);
+    expect(miss.candidates).toEqual(['single', 'married filing jointly']);
+  });
+
   it('selects by value when the option label does not match', async () => {
     const r = await setFieldByLabel(page, 'State', 'NJ', 'select');
     expect(r.ok).toBe(true);

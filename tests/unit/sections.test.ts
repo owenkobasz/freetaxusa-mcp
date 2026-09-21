@@ -1,10 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { SECTIONS, normalizeSectionName, resolveSidFromMap, type SidMap } from '../../src/types/sections.js';
+import { SECTIONS, normalizeSectionName, resolveSidFromMap, type SidMap, type SectionItem } from '../../src/types/sections.js';
 
-function mapOf(entries: Array<[string, number]>): SidMap {
+function mapOf(entries: Array<[string, number]>, items: SectionItem[] = []): SidMap {
   return {
     byName: new Map(entries.map(([n, s]) => [n.toLowerCase(), s])),
     bySid: new Map(entries.map(([n, s]) => [s, n])),
+    items,
     discoveredAt: Date.now(),
   };
 }
@@ -28,24 +29,35 @@ describe('normalizeSectionName', () => {
 });
 
 describe('resolveSidFromMap', () => {
-  const map = mapOf([
-    ['Personal Info', 14],
-    ['Wages (W-2)', 22],
-    ['Interest Income (1099-INT)', 23],
-    ['Dividend Income (1099-DIV)', 24],
-    ['Summary', 91],
-  ]);
+  const map = mapOf(
+    [
+      ['Personal Info', 14],
+      ['Wages (W-2)', 22],
+      ['Interest Income (1099-INT)', 23],
+      ['Dividend Income (1099-DIV)', 24],
+      ['Summary', 91],
+    ],
+    [
+      { name: 'Taxpayer Information', group: 'Personal Info', disabled: false },
+      { name: 'Filing Status', group: 'Personal Info', disabled: true },
+    ],
+  );
 
   it('returns an exact sidebar match', () => {
     expect(resolveSidFromMap(map, 'summary')).toEqual({ sid: 91 });
   });
 
   it('resolves an alias through the sidebar before the fallback', () => {
-    expect(resolveSidFromMap(map, 'taxpayer info')).toEqual({ sid: 14 });
+    expect(resolveSidFromMap(map, 'personal')).toEqual({ sid: 14 });
   });
 
-  it('uses the fallback SID when the sidebar has no match', () => {
-    expect(resolveSidFromMap(map, 'filing status')).toEqual({ sid: 12 });
+  it('resolves a dropdown sub-page by name or alias', () => {
+    expect(resolveSidFromMap(map, 'Taxpayer Information')).toEqual({ item: { name: 'Taxpayer Information', group: 'Personal Info', disabled: false } });
+    expect(resolveSidFromMap(map, 'filing status')).toEqual({ item: { name: 'Filing Status', group: 'Personal Info', disabled: true } });
+  });
+
+  it('uses the fallback page id when the sidebar has no match', () => {
+    expect(resolveSidFromMap(map, 'income')).toEqual({ sid: 301400 });
   });
 
   it('returns a unique partial match', () => {

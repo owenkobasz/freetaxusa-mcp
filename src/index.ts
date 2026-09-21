@@ -2,7 +2,7 @@
 
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { createServer } from './server.js';
-import { closeBrowser } from './browser/context.js';
+import { detachBrowser } from './browser/context.js';
 
 async function main(): Promise<void> {
   const server = createServer();
@@ -13,7 +13,9 @@ async function main(): Promise<void> {
   const shutdown = async (): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
-    await closeBrowser();
+    // Leave Chrome running so the next server process can reattach without a
+    // new sign-in. Only logout closes it.
+    await detachBrowser();
     process.exit(0);
   };
 

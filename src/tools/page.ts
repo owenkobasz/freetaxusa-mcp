@@ -1,8 +1,7 @@
 import { z } from 'zod';
-import { getPage, isSessionExpired, extractSidFromUrl, acquirePageLock } from '../browser/context.js';
-import { readFormFields, clickSaveAndContinue, getPageTitle } from '../browser/forms.js';
-import { resolveSid, navigateToSid, discoverSidMap, assertPage } from '../browser/navigation.js';
-import { waitForPageReady } from '../browser/wait.js';
+import { getPage, isSessionExpired, getCurrentPageId, acquirePageLock } from '../browser/context.js';
+import { readFormFields, readPageOutline, readModal, clickSaveAndContinue, getValidationErrors, getPageTitle } from '../browser/forms.js';
+import { resolveSid, navigateToSid, navigateToItem, discoverSections, assertPage, waitForPageChange } from '../browser/navigation.js';
 import { guardPage } from '../security/guards.js';
 import { sessionExpiredResult } from './session.js';
 
@@ -13,12 +12,13 @@ export async function readCurrentPage(): Promise<Record<string, unknown>> {
   try {
     const page = await getPage();
     if (await isSessionExpired()) return sessionExpiredResult;
-    const url = page.url();
+    const modal = await readModal(page);
     return {
       success: true,
       pageTitle: await getPageTitle(page),
-      sid: extractSidFromUrl(url),
-      url,
+      pageId: await getCurrentPageId(page),
+      ...(modal ? { modal, hint: 'A dialog is open over the page. click_button acts on its buttons until it closes.' } : {}),
+      ...(await readPageOutline(page)),
       fields: await readFormFields(page),
     };
   } finally {
@@ -39,13 +39,20 @@ export async function saveAndContinue(): Promise<Record<string, unknown>> {
       return { success: false, error: 'refused_filing_page', title: guard.title, message: 'Filing and payment pages must be completed by the user in the browser.' };
     }
 
-    const errors = await clickSaveAndContinue(page);
-    await waitForPageReady(page);
+    const before = await page.locator('#taxForm input[name="uniquePageId"]').first().inputValue({ timeout: 1_000 }).catch(() => '');
+    const beforeId = await getCurrentPageId(page);
+    if (!(await clickSaveAndContinue(page))) {
+      return { success: false, error: 'no_continue_button', currentPage: await getPageTitle(page), pageId: beforeId };
+    }
+    await waitForPageChange(page, before);
+    if (await isSessionExpired()) return sessionExpiredResult;
     const title = await getPageTitle(page);
-    const sid = extractSidFromUrl(page.url());
+    const pageId = await getCurrentPageId(page);
+    const errors = await getValidationErrors(page);
 
-    if (errors.length > 0) return { success: false, errors, currentPage: title, currentSid: sid };
-    return { success: true, nextPage: title, nextSid: sid };
+    if (errors.length > 0) return { success: false, errors, currentPage: title, pageId };
+    if (pageId === beforeId) return { success: false, error: 'page_unchanged', currentPage: title, pageId, message: 'The page did not advance. Call read_current_page to look for what is missing.' };
+    return { success: true, nextPage: title, pageId };
   } finally {
     release();
   }
@@ -53,8 +60,8 @@ export async function saveAndContinue(): Promise<Record<string, unknown>> {
 
 export const navigateSectionSchema = z
   .object({
-    section: z.string().optional().describe('Section name (e.g., "income", "deductions", "personal info")'),
-    sid: z.number().optional().describe('Direct SID number to navigate to'),
+    section: z.string().optional().describe('Section or sub-page name from list_sections (e.g., "income", "Taxpayer Information")'),
+    sid: z.number().optional().describe('Page id from list_sections'),
   })
   .refine(data => data.section !== undefined || data.sid !== undefined, {
     message: 'Either section name or sid must be provided',
@@ -74,11 +81,14 @@ export async function navigateSection(input: z.infer<typeof navigateSectionSchem
     }
 
     try {
-      const result = await navigateToSid(resolved.sid);
-      return { success: true, currentPage: result.title, sid: result.sid, url: result.url };
+      const result = 'item' in resolved ? await navigateToItem(resolved.item) : await navigateToSid(resolved.sid);
+      return { success: true, currentPage: result.title, pageId: result.pageId };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       if (message === 'SESSION_EXPIRED') return sessionExpiredResult;
+      if (message === 'ITEM_INACTIVE') {
+        return { success: false, error: 'section_inactive', message: 'That page is not available yet; earlier pages must be completed first.' };
+      }
       return { success: false, error: 'navigation_failed', message };
     }
   } finally {
@@ -96,7 +106,7 @@ export async function expectPage(input: z.infer<typeof expectPageSchema>): Promi
     const page = await getPage();
     if (await isSessionExpired()) return sessionExpiredResult;
     const result = await assertPage(page, input.titleContains);
-    return { success: true, ok: result.ok, actualTitle: result.actualTitle, sid: extractSidFromUrl(page.url()) };
+    return { success: true, ok: result.ok, actualTitle: result.actualTitle, pageId: await getCurrentPageId(page) };
   } finally {
     release();
   }
@@ -112,10 +122,12 @@ export async function listSections(input: z.infer<typeof listSectionsSchema>): P
     const page = await getPage();
     if (await isSessionExpired()) return sessionExpiredResult;
     const before = Date.now();
-    const map = await discoverSidMap(page, input.refresh ?? false);
-    const sections = Array.from(map.bySid.entries())
-      .map(([sid, name]) => ({ sid, name }))
-      .sort((a, b) => a.sid - b.sid);
+    const map = await discoverSections(page, input.refresh ?? false);
+    const sections = Array.from(map.bySid.entries()).map(([pageId, name]) => ({
+      name,
+      pageId,
+      pages: map.items.filter(i => i.group === name).map(i => (i.disabled ? `${i.name} (not yet available)` : i.name)),
+    }));
     return { success: true, sections, discoveredAt: new Date(map.discoveredAt).toISOString(), fromCache: map.discoveredAt < before };
   } finally {
     release();

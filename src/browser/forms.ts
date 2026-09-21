@@ -1,6 +1,5 @@
-import { type Locator, type Page } from 'playwright';
+import { type Frame, type Locator, type Page } from 'playwright';
 import { type FormField } from '../types/tax.js';
-import { waitForPageReady } from './wait.js';
 
 export type FieldKind = 'auto' | 'text' | 'select' | 'radio' | 'checkbox';
 
@@ -24,6 +23,38 @@ export function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message.split('\n')[0] : String(err);
 }
 
+export interface PageOutline {
+  headings: string[];
+  buttons: string[];
+  links: string[];
+}
+
+/** Visible headings, buttons and links, so pages without form fields can be driven. */
+export async function readPageOutline(page: Page): Promise<PageOutline> {
+  return page.evaluate(() => {
+    function isShown(el: Element): boolean {
+      return el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
+    }
+    function texts(selector: string, limit: number): string[] {
+      const seen = new Set<string>();
+      for (const el of document.querySelectorAll<HTMLElement>(selector)) {
+        if (!isShown(el)) continue;
+        const text = (el.getAttribute('aria-label') || (el as HTMLInputElement).value || el.innerText || '')
+          .replace(/\s+/g, ' ')
+          .trim();
+        if (text && text.length <= 120) seen.add(text);
+        if (seen.size >= limit) break;
+      }
+      return [...seen];
+    }
+    return {
+      headings: texts('h1, h2, h3', 20),
+      buttons: texts('button, input[type="submit"], input[type="button"], [role="button"]', 40),
+      links: texts('a[href]', 80),
+    };
+  });
+}
+
 export async function readFormFields(page: Page): Promise<FormField[]> {
   return page.evaluate(() => {
     const fields: FormField[] = [];
@@ -32,33 +63,46 @@ export async function readFormFields(page: Page): Promise<FormField[]> {
       return el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
     }
 
+    // Label text without the FAQ button FreeTaxUSA nests inside labels, and
+    // without the trailing colon.
+    function labelText(el: Element | null): string {
+      if (!el) return '';
+      const clone = el.cloneNode(true) as HTMLElement;
+      clone.querySelectorAll('button, a, [role="button"], .visually-hidden, .sr-only').forEach(n => n.remove());
+      return (clone.textContent ?? '')
+        .replace(/open faq window/gi, '')
+        .replace(/\s+/g, ' ')
+        .replace(/\s*[:*]\s*$/, '')
+        .trim();
+    }
+
     function labelFor(el: HTMLElement): string {
       const ariaLabel = el.getAttribute('aria-label');
       if (ariaLabel) return ariaLabel;
       const id = el.getAttribute('id');
       if (id) {
-        const label = document.querySelector(`label[for="${id}"]`);
-        if (label?.textContent?.trim()) return label.textContent.trim();
+        const text = labelText(document.querySelector(`label[for="${id}"]`));
+        if (text) return text;
       }
-      const parentLabel = el.closest('label');
-      if (parentLabel?.textContent?.trim()) return parentLabel.textContent.trim();
+      const parentText = labelText(el.closest('label'));
+      if (parentText) return parentText;
       const labelledBy = el.getAttribute('aria-labelledby');
       if (labelledBy) {
-        const labelEl = document.getElementById(labelledBy);
-        if (labelEl?.textContent?.trim()) return labelEl.textContent.trim();
+        const text = labelText(document.getElementById(labelledBy));
+        if (text) return text;
       }
       return el.getAttribute('name') || el.getAttribute('placeholder') || '';
     }
 
     function groupLabel(first: HTMLInputElement, name: string): string {
-      const legend = first.closest('fieldset')?.querySelector('legend');
-      if (legend?.textContent?.trim()) return legend.textContent.trim();
+      const legend = labelText(first.closest('fieldset')?.querySelector('legend') ?? null);
+      if (legend) return legend;
       let node: Element | null = first.closest('fieldset, div, tr, li, p') ?? first;
       for (let i = 0; i < 6 && node; i++) {
         const prev: Element | null = node.previousElementSibling;
         if (prev) {
           if (/^(H[1-6]|LABEL|LEGEND|P)$/.test(prev.tagName)) {
-            const text = prev.textContent?.trim();
+            const text = labelText(prev);
             if (text) return text.slice(0, 120);
           }
           node = prev;
@@ -138,6 +182,9 @@ export async function resolveLabel(page: Page, label: string): Promise<LabelReso
   const attempts: Locator[] = [
     page.getByLabel(label, { exact: true }),
     page.getByLabel(new RegExp(`^\\s*${escapeRegExp(label)}\\s*[:*]?\\s*$`, 'i')),
+    // Labels as read_current_page reports them, with the nested FAQ button text
+    // and trailing colon removed, so match on the label as a prefix.
+    page.getByLabel(new RegExp(`^\\s*${escapeRegExp(label)}\\s*[:*]?(\\s*open faq window)?\\s*(\\(|$)`, 'i')),
     page.getByLabel(label, { exact: false }),
   ];
   for (const locator of attempts) {
@@ -153,9 +200,78 @@ export async function resolveLabel(page: Page, label: string): Promise<LabelReso
   return { ok: false, reason: 'not_found', candidates: [] };
 }
 
+/**
+ * Find a radio option by its group's question (as read_current_page reports
+ * it) and the option text. Returns the input's id, or null.
+ */
+async function findRadioInGroup(page: Page, question: string, option: string): Promise<{ id: string | null; groups: string[] }> {
+  return page.evaluate(
+    ({ question, option }) => {
+      const clean = (text: string): string =>
+        text
+          .replace(/open faq window/gi, '')
+          .replace(/\s+/g, ' ')
+          .replace(/\s*[:*]\s*$/, '')
+          .trim()
+          .toLowerCase();
+      const labelOf = (el: HTMLInputElement): string => {
+        const byFor = el.id ? document.querySelector(`label[for="${el.id}"]`) : null;
+        return clean((el.getAttribute('aria-label') || byFor?.textContent || el.closest('label')?.textContent || el.value || '').toString());
+      };
+      const groupOf = (el: HTMLInputElement): string => {
+        const legend = el.closest('fieldset')?.querySelector('legend');
+        if (legend?.textContent?.trim()) return clean(legend.textContent);
+        let node: Element | null = el.closest('fieldset, div, tr, li, p') ?? el;
+        for (let i = 0; i < 6 && node; i++) {
+          const prev: Element | null = node.previousElementSibling;
+          if (prev) {
+            if (/^(H[1-6]|LABEL|LEGEND|P)$/.test(prev.tagName) && prev.textContent?.trim()) return clean(prev.textContent).slice(0, 120);
+            node = prev;
+          } else {
+            node = node.parentElement;
+          }
+        }
+        return clean(el.name);
+      };
+      const want = clean(question);
+      const wantOption = clean(option);
+      const groups = new Map<string, HTMLInputElement[]>();
+      for (const el of document.querySelectorAll<HTMLInputElement>('input[type="radio"]')) {
+        if (el.getClientRects().length === 0) continue;
+        const key = groupOf(el);
+        groups.set(key, [...(groups.get(key) ?? []), el]);
+      }
+      const names = [...groups.keys()];
+      const exact = names.filter(n => n === want);
+      const partial = exact.length > 0 ? exact : names.filter(n => n.includes(want) || want.includes(n));
+      if (partial.length !== 1) return { id: null, groups: names };
+      const hit = groups.get(partial[0])!.find(el => labelOf(el) === wantOption) ?? groups.get(partial[0])!.find(el => labelOf(el).startsWith(wantOption));
+      if (!hit) return { id: null, groups: groups.get(partial[0])!.map(labelOf) };
+      if (!hit.id) hit.id = `mcp-radio-${Math.random().toString(36).slice(2)}`;
+      return { id: hit.id, groups: [] };
+    },
+    { question, option },
+  );
+}
+
 export async function setFieldByLabel(page: Page, label: string, value: string, kind: FieldKind = 'auto'): Promise<FieldResult> {
   const resolved = await resolveLabel(page, label);
-  if (!resolved.ok) return { ok: false, reason: resolved.reason, candidates: resolved.candidates };
+  if (!resolved.ok) {
+    // A radio group is addressed by its question, with the option as the value.
+    if (kind === 'radio' || kind === 'auto') {
+      const radio = await findRadioInGroup(page, label, value);
+      if (radio.id) {
+        try {
+          await page.locator(`input[type="radio"][id="${radio.id.replace(/"/g, '\\"')}"]`).check({ timeout: 1_000 });
+          return { ok: true, matchedLabel: label, via: 'radio' };
+        } catch (err) {
+          return { ok: false, matchedLabel: label, via: 'radio', reason: errorMessage(err) };
+        }
+      }
+      if (kind === 'radio') return { ok: false, reason: 'not_found', candidates: radio.groups };
+    }
+    return { ok: false, reason: resolved.reason, candidates: resolved.candidates };
+  }
 
   const { locator, matchedLabel } = resolved;
   const info = await locator.evaluate(el => ({
@@ -193,17 +309,46 @@ export async function setFieldByLabel(page: Page, label: string, value: string, 
   }
 }
 
+/**
+ * FreeTaxUSA opens confirmations and side flows in a fancybox iframe
+ * (modalcontrol?tp=N) that intercepts clicks on the page beneath.
+ */
+export function activeModalFrame(page: Page): Frame | null {
+  return page.frames().find(f => f.url().includes('/modalcontrol')) ?? null;
+}
+
+export interface ModalInfo {
+  text: string;
+  buttons: string[];
+}
+
+export async function readModal(page: Page): Promise<ModalInfo | null> {
+  const frame = activeModalFrame(page);
+  if (!frame) return null;
+  const text = (await frame.locator('body').innerText({ timeout: 2_000 }).catch(() => ''))
+    .replace(/^-?\s*closes the window\s*/i, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 600);
+  const buttons = (await frame.locator('button, input[type="submit"], a.btn').allInnerTexts().catch(() => []))
+    .map(b => b.trim())
+    .filter(b => b && !/closes the window/i.test(b));
+  return { text, buttons: [...new Set(buttons)] };
+}
+
 export type ButtonResolution =
   | { ok: true; locator: Locator; name: string }
   | { ok: false; reason: 'not_found' | 'ambiguous'; candidates: string[] };
 
 export async function findButton(page: Page, name: string): Promise<ButtonResolution> {
-  const exact = page.getByRole('button', { name, exact: true }).or(page.getByRole('link', { name, exact: true }));
+  // An open modal covers the page, so its buttons are the only ones clickable.
+  const scope: Page | Frame = activeModalFrame(page) ?? page;
+  const exact = scope.getByRole('button', { name, exact: true }).or(scope.getByRole('link', { name, exact: true }));
   let target = exact;
   let count = await exact.count();
   if (count === 0) {
     const pattern = new RegExp(`\\b${escapeRegExp(name)}\\b`, 'i');
-    target = page.getByRole('button', { name: pattern }).or(page.getByRole('link', { name: pattern }));
+    target = scope.getByRole('button', { name: pattern }).or(scope.getByRole('link', { name: pattern }));
     count = await target.count();
   }
   if (count === 0) return { ok: false, reason: 'not_found', candidates: [] };
@@ -212,7 +357,8 @@ export async function findButton(page: Page, name: string): Promise<ButtonResolu
   return { ok: true, locator: target.first(), name: names[0] || name };
 }
 
-export async function clickSaveAndContinue(page: Page): Promise<string[]> {
+/** Click Save and Continue. The caller waits for the page swap and then reads errors. */
+export async function clickSaveAndContinue(page: Page): Promise<boolean> {
   const button = page
     .getByRole('button', { name: /save and continue/i })
     .or(page.getByRole('button', { name: /^continue$/i }))
@@ -220,21 +366,25 @@ export async function clickSaveAndContinue(page: Page): Promise<string[]> {
     .first();
   try {
     await button.click({ timeout: 3_000 });
+    return true;
   } catch {
-    return ['Could not find Save and Continue button'];
+    return false;
   }
-  await waitForPageReady(page);
-  return getValidationErrors(page);
 }
 
 export async function getValidationErrors(page: Page): Promise<string[]> {
   const errors: string[] = [];
-  const candidates = page.locator('.error, .err, [class*="error"], [role="alert"]');
+  const candidates = page.locator('.audit-message.error-message, .error-message, .error, .err, [role="alert"]');
   const count = Math.min(await candidates.count().catch(() => 0), 20);
   for (let i = 0; i < count; i++) {
     const el = candidates.nth(i);
     if (!(await el.isVisible().catch(() => false))) continue;
-    const text = (await el.innerText().catch(() => '')).trim();
+    // Drop the screen-reader prefix and the "Fix This" link text FreeTaxUSA adds.
+    const text = (await el.innerText().catch(() => ''))
+      .replace(/^-?\s*red error message\s*/i, '')
+      .replace(/\s*fix this\s*$/i, '')
+      .replace(/\s+/g, ' ')
+      .trim();
     if (text && !errors.includes(text)) errors.push(text);
   }
   return errors;

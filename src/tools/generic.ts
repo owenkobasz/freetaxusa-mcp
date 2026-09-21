@@ -1,7 +1,7 @@
 import { z } from 'zod';
-import { getPage, isSessionExpired, acquirePageLock, extractSidFromUrl } from '../browser/context.js';
-import { setFieldByLabel, findButton, getValidationErrors, getPageTitle, type FieldResult } from '../browser/forms.js';
-import { waitForPageReady } from '../browser/wait.js';
+import { getPage, isSessionExpired, acquirePageLock, getCurrentPageId } from '../browser/context.js';
+import { setFieldByLabel, findButton, readModal, getValidationErrors, getPageTitle, type FieldResult } from '../browser/forms.js';
+import { waitForPageChange } from '../browser/navigation.js';
 import { guardPage, isPaymentField, isDangerousButton } from '../security/guards.js';
 import { sessionExpiredResult } from './session.js';
 
@@ -11,7 +11,7 @@ export const fillFieldsSchema = z.object({
   fields: z
     .array(
       z.object({
-        label: z.string().min(1).describe('Accessible label of the field, as shown by read_current_page. For a radio option, the option text.'),
+        label: z.string().min(1).describe('Field label as shown by read_current_page. For a radio group, the question; the option goes in value.'),
         value: z.string().describe('Value to enter. For checkbox or radio use "true"/"false".'),
         kind: fieldKind.optional().describe('Field kind. Defaults to "auto", which detects the element type.'),
       }),
@@ -40,16 +40,12 @@ export async function fillFields(input: z.infer<typeof fillFieldsSchema>): Promi
     }
 
     const failed = results.filter(r => !r.ok).map(r => r.label);
-    if (failed.length === input.fields.length) {
-      await page.reload({ waitUntil: 'domcontentloaded', timeout: 15_000 }).catch(() => undefined);
-      await waitForPageReady(page);
-      if (await isSessionExpired()) return sessionExpiredResult;
-    }
+    if (await isSessionExpired()) return sessionExpiredResult;
 
     return {
       success: failed.length === 0,
       pageTitle: await getPageTitle(page),
-      sid: extractSidFromUrl(page.url()),
+      pageId: await getCurrentPageId(page),
       results,
       failed,
       validationErrors: await getValidationErrors(page),
@@ -89,14 +85,25 @@ export async function clickButton(input: z.infer<typeof clickButtonSchema>): Pro
       return { success: false, error: 'refused_button', name: found.name, message: 'Filing, purchase and payment actions must be done by the user in the browser.' };
     }
 
+    const before = await page.locator('#taxForm input[name="uniquePageId"]').first().inputValue({ timeout: 1_000 }).catch(() => '');
     try {
       await found.locator.click({ timeout: 3_000 });
     } catch (err) {
       return { success: false, error: 'click_failed', name: found.name, message: err instanceof Error ? err.message.split('\n')[0] : String(err) };
     }
-    await waitForPageReady(page);
+    // Most buttons swap the page over AJAX; a button that only toggles
+    // something in place just waits out the change timeout.
+    await waitForPageChange(page, before);
+    if (await isSessionExpired()) return sessionExpiredResult;
 
-    return { success: true, clicked: found.name, currentPage: await getPageTitle(page), sid: extractSidFromUrl(page.url()), url: page.url() };
+    const modal = await readModal(page);
+    return {
+      success: true,
+      clicked: found.name,
+      currentPage: await getPageTitle(page),
+      pageId: await getCurrentPageId(page),
+      ...(modal ? { modal, hint: 'A dialog opened. Answer it with click_button before doing anything else.' } : {}),
+    };
   } finally {
     release();
   }

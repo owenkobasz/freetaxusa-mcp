@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { evaluateGuard, isPaymentField, isDangerousButton } from '../../src/security/guards.js';
 
 describe('evaluateGuard', () => {
-  it.each(['File Your Return', 'E-File Now', 'Payment Method', 'Checkout', 'Billing Information', 'Order Summary', 'Sign and File'])(
+  it.each(['File Your Return', 'E-File Now', 'Payment Method', 'Checkout', 'Billing Information', 'Order Summary', 'Sign and File', 'Unlock more benefits', 'Cart Summary'])(
     'refuses "%s"',
     heading => {
       expect(evaluateGuard('FreeTaxUSA', heading).refused).toBe(true);
@@ -36,7 +36,7 @@ describe('isPaymentField', () => {
 });
 
 describe('isDangerousButton', () => {
-  it.each(['File My Return', 'E-File', 'Submit', 'Pay Now', 'Upgrade to Deluxe', 'Order', 'Buy State'])('refuses "%s"', name => {
+  it.each(['File My Return', 'E-File', 'Submit', 'Pay Now', 'Upgrade to Deluxe', 'Order', 'Buy State', 'Add for $19.99', 'Add to cart', 'Cart Summary'])('refuses "%s"', name => {
     expect(isDangerousButton(name)).toBe(true);
   });
 

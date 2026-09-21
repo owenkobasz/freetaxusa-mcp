@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { getPage, isSessionExpired, acquirePageLock } from '../browser/context.js';
-import { resolveSid, navigateToSid, assertPage } from '../browser/navigation.js';
+import { resolveSid, navigateToSid, navigateToItem, assertPage } from '../browser/navigation.js';
 import { SECTIONS } from '../types/sections.js';
 import { sessionExpiredResult } from './session.js';
 
@@ -79,7 +79,8 @@ export async function getTaxSummary(): Promise<Record<string, unknown>> {
       return { success: false, error: 'section_ambiguous', candidates: resolved.ambiguous };
     }
     try {
-      await navigateToSid(resolved?.sid ?? SECTIONS.summary.fallbackSid!);
+      if (resolved !== null && 'item' in resolved) await navigateToItem(resolved.item);
+      else await navigateToSid(resolved !== null && 'sid' in resolved ? resolved.sid : SECTIONS.summary.fallbackSid!);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       if (message === 'SESSION_EXPIRED') return sessionExpiredResult;

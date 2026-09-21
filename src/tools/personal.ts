@@ -1,12 +1,13 @@
 import { z } from 'zod';
 import { getPage, isSessionExpired, acquirePageLock } from '../browser/context.js';
-import { resolveSid, navigateToSid, assertPage } from '../browser/navigation.js';
+import { resolveSid, navigateToSid, navigateToItem, assertPage } from '../browser/navigation.js';
 import { setFieldByLabel, getValidationErrors, type FieldResult, type FieldKind } from '../browser/forms.js';
 import { SECTIONS } from '../types/sections.js';
 import { sessionExpiredResult } from './session.js';
 
-// TODO(verify on live site): expected headings for these pages have not been checked against FreeTaxUSA.
-const TAXPAYER_PAGE = /personal|taxpayer|basic info|your info/i;
+// Live site: the taxpayer page is headed "Tell us about yourself".
+const TAXPAYER_PAGE = /about yourself|personal|taxpayer|basic info|your info/i;
+// TODO(verify on live site): the filing status heading has not been checked against FreeTaxUSA.
 const FILING_STATUS_PAGE = /filing status/i;
 
 type NavOutcome = { ok: true } | { ok: false; result: Record<string, unknown> };
@@ -16,12 +17,13 @@ async function goToSection(key: keyof typeof SECTIONS, expected: RegExp): Promis
   if (resolved !== null && 'ambiguous' in resolved) {
     return { ok: false, result: { success: false, error: 'section_ambiguous', candidates: resolved.ambiguous } };
   }
-  const sid = resolved?.sid ?? SECTIONS[key].fallbackSid;
-  if (sid === undefined) {
+  const sid = resolved !== null && 'sid' in resolved ? resolved.sid : SECTIONS[key].fallbackSid;
+  if (!(resolved !== null && 'item' in resolved) && sid === undefined) {
     return { ok: false, result: { success: false, error: 'section_not_found', section: key } };
   }
   try {
-    await navigateToSid(sid);
+    if (resolved !== null && 'item' in resolved) await navigateToItem(resolved.item);
+    else await navigateToSid(sid!);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     if (message === 'SESSION_EXPIRED') return { ok: false, result: sessionExpiredResult };
@@ -82,7 +84,7 @@ export async function fillTaxpayerInfo(input: z.infer<typeof fillTaxpayerInfoSch
       zip: await firstMatch(['ZIP Code', 'Zip', 'ZIP'], input.address.zip, 'text'),
     };
     if (input.middleInitial) results.middleInitial = await firstMatch(['Middle Initial', 'M.I.'], input.middleInitial, 'text');
-    if (input.suffix) results.suffix = await firstMatch(['Suffix'], input.suffix, 'select');
+    if (input.suffix) results.suffix = await firstMatch(['Suffix', 'Jr., Sr., III'], input.suffix, 'select');
     if (input.address.apt) results.apt = await firstMatch(['Apt', 'Apartment', 'Apt/Unit'], input.address.apt, 'text');
     if (input.address.zip4) results.zip4 = await firstMatch(['ZIP+4', '+4'], input.address.zip4, 'text');
 
