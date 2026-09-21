@@ -2,7 +2,6 @@ node_modules/
 dist/
 .env
 *.log
-.thesun/
 
 # Browser profile (contains session cookies)
 .freetaxusa-mcp/

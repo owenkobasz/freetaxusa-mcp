@@ -1,49 +1,34 @@
 # FreeTaxUSA MCP Server
 
-Browser automation MCP for FreeTaxUSA tax filing using Playwright.
+Browser automation MCP for FreeTaxUSA using Playwright. Fork of schwarztim/freetaxusa-mcp with the audit fixes applied.
 
 ## Architecture
 
 - **Transport**: stdio
-- **Browser**: Playwright persistent Chromium context at `~/.freetaxusa-mcp/browser-profile/`
-- **Navigation**: SID-based URL parameters (`?sid=N`), dynamically discovered from nav sidebar
-- **Form interaction**: Accessibility tree targeting (not CSS selectors)
-- **Security**: PII filter on all outputs (SSN masking, account number masking)
-- **Concurrency**: Async mutex prevents concurrent page operations
+- **Browser**: Playwright persistent Chromium context at `~/.freetaxusa-mcp/browser-profile/`, visible window required
+- **Navigation**: `?sid=N` URL parameters discovered from the sidebar at runtime, with fallbacks in `src/types/sections.ts`
+- **Form interaction**: accessible-label targeting, exact match first, substring only when unique
+- **Guards**: `src/security/guards.ts` refuses filing, payment and checkout pages, card fields, and filing or purchase buttons in every tool that acts on a page
+- **Redaction**: `src/security/pii-filter.ts` masks SSN, EIN and long digit runs in tool output only. Names, addresses, dates and dollar amounts are not masked, and everything passed as a tool argument is in the Claude Code transcript.
+- **Concurrency**: one async mutex serializes all page operations
 
 ## Commands
 
 ```bash
 npm run build    # TypeScript compile
-npm run start    # Run server (stdio)
-npm run dev      # Run with tsx (development)
-npm test         # Run unit tests
+npm test         # Unit tests (the forms suite launches headless Chromium)
+npm run dev      # Run with tsx
 ```
 
-## Tool Categories
+## Tools
 
-### Phase 1 (Implemented)
-- `authenticate` - Login with email/password
-- `get_session_status` - Check session state
-- `read_current_page` - Read form fields on current page
-- `save_and_continue` - Submit current page
-- `navigate_section` - Jump to section by name or SID
-- `fill_taxpayer_info` - Fill personal info
-- `fill_filing_status` - Set filing status
-- `get_tax_summary` - Return overview
-- `get_refund_estimate` - Refund/owed amount
+`login_manual`, `logout`, `get_session_status`, `list_sections`, `navigate_section`, `expect_page`, `read_current_page`, `fill_fields`, `click_button`, `save_and_continue`, `fill_taxpayer_info`, `fill_filing_status`, `get_tax_summary`, `get_refund_estimate`
 
-### Phase 2 (Stubbed)
-- `fill_w2_income`, `fill_1099_income`
+## Working rules
 
-### Phase 3 (Stubbed)
-- `fill_deductions`, `review_return`, `file_extension`, `get_form_status`
-
-## Security
-
-- Credentials never stored to disk
-- PII filtered from all tool outputs
-- Browser profile chmod 0700
-- Anti-bot flags on browser launch
-- Session expiry detected on every tool call
-- State filing paywall detection
+- Never ask the user for their FreeTaxUSA password or MFA code. `login_manual` opens the window; they sign in.
+- Claude reads and fills. The user reviews, pays for state, and files. Those pages are refused by the guards.
+- Call `expect_page` or `read_current_page` before `fill_fields` on a new page.
+- `save_and_continue` before `navigate_section`. Navigating away discards unsaved edits.
+- Treat `get_refund_estimate` and `get_tax_summary` figures as hints until confirmed on screen.
+- Expected page headings in `src/tools/personal.ts` and `overview.ts` are marked `TODO(verify on live site)` until checked against a real session.
