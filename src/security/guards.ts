@@ -5,7 +5,9 @@ export const FILING_PAGE =
   /\b(e-?file|file (my|your) return|sign and file|submit (my |your )?return|payment method|payment information|checkout|billing|order summary|cart summary|unlock more benefits|your cart)\b/i;
 export const PAYMENT_FIELD = /\b(card|cvv|cvc|security code)\b/i;
 // Anything priced ("Add for $19.99") or that adds to a cart counts as a purchase action.
-export const DANGEROUS_BUTTON = /\b(e-?file|file|submit|transmit|pay|purchase|buy|checkout|upgrade|order|add to cart|cart)\b|\$\s?\d/i;
+// Paid add-ons are offered as "Add Pro Support", "Add Audit Defense", "Add Deluxe".
+export const DANGEROUS_BUTTON =
+  /\b(e-?file|file|submit|transmit|pay|purchase|buy|checkout|upgrade|order|add to cart|cart)\b|\$\s?\d|\badd\b.*\b(pro support|deluxe|audit defense|support plan)\b/i;
 
 export interface GuardResult {
   refused: boolean;

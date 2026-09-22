@@ -36,7 +36,7 @@ describe('isPaymentField', () => {
 });
 
 describe('isDangerousButton', () => {
-  it.each(['File My Return', 'E-File', 'Submit', 'Pay Now', 'Upgrade to Deluxe', 'Order', 'Buy State', 'Add for $19.99', 'Add to cart', 'Cart Summary'])('refuses "%s"', name => {
+  it.each(['File My Return', 'E-File', 'Submit', 'Pay Now', 'Upgrade to Deluxe', 'Order', 'Buy State', 'Add for $19.99', 'Add to cart', 'Cart Summary', 'Add Pro Support', 'Add Deluxe', 'Add Audit Defense'])('refuses "%s"', name => {
     expect(isDangerousButton(name)).toBe(true);
   });
 

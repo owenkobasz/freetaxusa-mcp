@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { getPage, isSessionExpired, acquirePageLock } from '../browser/context.js';
-import { resolveSid, navigateToSid, navigateToItem, assertPage } from '../browser/navigation.js';
+import { resolveSid, navigateToSid, navigateToItem, assertPage, clearSidMapCache } from '../browser/navigation.js';
 import { setFieldByLabel, getValidationErrors, type FieldResult, type FieldKind } from '../browser/forms.js';
 import { SECTIONS } from '../types/sections.js';
 import { sessionExpiredResult } from './session.js';
@@ -13,6 +13,11 @@ const FILING_STATUS_PAGE = /filing status/i;
 type NavOutcome = { ok: true } | { ok: false; result: Record<string, unknown> };
 
 async function goToSection(key: keyof typeof SECTIONS, expected: RegExp): Promise<NavOutcome> {
+  // Already there (the previous page's save often lands here): don't navigate,
+  // which would discard nothing but costs a round trip and a stale section map.
+  if ((await assertPage(await getPage(), expected)).ok) return { ok: true };
+
+  clearSidMapCache();
   const resolved = await resolveSid(key);
   if (resolved !== null && 'ambiguous' in resolved) {
     return { ok: false, result: { success: false, error: 'section_ambiguous', candidates: resolved.ambiguous } };
@@ -27,6 +32,9 @@ async function goToSection(key: keyof typeof SECTIONS, expected: RegExp): Promis
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     if (message === 'SESSION_EXPIRED') return { ok: false, result: sessionExpiredResult };
+    if (message === 'ITEM_INACTIVE') {
+      return { ok: false, result: { success: false, error: 'section_inactive', message: 'That page is not available yet; earlier pages must be completed first.' } };
+    }
     return { ok: false, result: { success: false, error: 'navigation_failed', message } };
   }
   const check = await assertPage(await getPage(), expected);
@@ -34,6 +42,27 @@ async function goToSection(key: keyof typeof SECTIONS, expected: RegExp): Promis
     return { ok: false, result: { success: false, error: 'wrong_page', actualTitle: check.actualTitle, expected: expected.source } };
   }
   return { ok: true };
+}
+
+// The state select's options are full names, not postal codes.
+const STATE_NAMES: Record<string, string> = {
+  AL: 'Alabama', AK: 'Alaska', AZ: 'Arizona', AR: 'Arkansas', CA: 'California', CO: 'Colorado', CT: 'Connecticut', DE: 'Delaware',
+  DC: 'District of Columbia', FL: 'Florida', GA: 'Georgia', HI: 'Hawaii', ID: 'Idaho', IL: 'Illinois', IN: 'Indiana', IA: 'Iowa',
+  KS: 'Kansas', KY: 'Kentucky', LA: 'Louisiana', ME: 'Maine', MD: 'Maryland', MA: 'Massachusetts', MI: 'Michigan', MN: 'Minnesota',
+  MS: 'Mississippi', MO: 'Missouri', MT: 'Montana', NE: 'Nebraska', NV: 'Nevada', NH: 'New Hampshire', NJ: 'New Jersey',
+  NM: 'New Mexico', NY: 'New York', NC: 'North Carolina', ND: 'North Dakota', OH: 'Ohio', OK: 'Oklahoma', OR: 'Oregon',
+  PA: 'Pennsylvania', RI: 'Rhode Island', SC: 'South Carolina', SD: 'South Dakota', TN: 'Tennessee', TX: 'Texas', UT: 'Utah',
+  VT: 'Vermont', VA: 'Virginia', WA: 'Washington', WV: 'West Virginia', WI: 'Wisconsin', WY: 'Wyoming',
+  AA: 'Armed Forces - AA', AE: 'Armed Forces - AE', AP: 'Armed Forces - AP',
+};
+
+async function firstMatchValue(labels: string[], values: string[], kind: FieldKind = 'auto'): Promise<FieldResult> {
+  let last: FieldResult = { ok: false, reason: 'not_found' };
+  for (const value of values.filter(Boolean)) {
+    last = await firstMatch(labels, value, kind);
+    if (last.ok) return last;
+  }
+  return last;
 }
 
 async function firstMatch(labels: string[], value: string, kind: FieldKind = 'auto'): Promise<FieldResult> {
@@ -80,7 +109,7 @@ export async function fillTaxpayerInfo(input: z.infer<typeof fillTaxpayerInfoSch
       occupation: await firstMatch(['Occupation'], input.occupation, 'text'),
       street: await firstMatch(['Street Address', 'Address'], input.address.street, 'text'),
       city: await firstMatch(['City'], input.address.city, 'text'),
-      state: await firstMatch(['State'], input.address.state, 'select'),
+      state: await firstMatchValue(['State'], [input.address.state, STATE_NAMES[input.address.state.toUpperCase()] ?? ''], 'select'),
       zip: await firstMatch(['ZIP Code', 'Zip', 'ZIP'], input.address.zip, 'text'),
     };
     if (input.middleInitial) results.middleInitial = await firstMatch(['Middle Initial', 'M.I.'], input.middleInitial, 'text');

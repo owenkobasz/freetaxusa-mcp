@@ -61,6 +61,11 @@ export async function fillFields(input: z.infer<typeof fillFieldsSchema>): Promi
 
 export const clickButtonSchema = z.object({
   name: z.string().min(1).describe('Button or link text, e.g. "Add a W-2", "Edit", "Delete", "Back"'),
+  context: z
+    .string()
+    .min(1)
+    .optional()
+    .describe('When the same button text appears in several rows, the heading of the row wanted, e.g. "Investments and Savings"'),
 });
 
 export async function clickButton(input: z.infer<typeof clickButtonSchema>): Promise<Record<string, unknown>> {
@@ -77,9 +82,15 @@ export async function clickButton(input: z.infer<typeof clickButtonSchema>): Pro
       return { success: false, error: 'refused_button', name: input.name, message: 'Filing, purchase and payment actions must be done by the user in the browser.' };
     }
 
-    const found = await findButton(page, input.name);
+    const found = await findButton(page, input.name, input.context);
     if (!found.ok) {
-      return { success: false, error: found.reason, name: input.name, candidates: found.candidates };
+      return {
+        success: false,
+        error: found.reason,
+        name: input.name,
+        candidates: found.candidates,
+        ...(found.reason === 'ambiguous' ? { hint: 'Pass context with the row heading shown in parentheses.' } : {}),
+      };
     }
     if (isDangerousButton(found.name)) {
       return { success: false, error: 'refused_button', name: found.name, message: 'Filing, purchase and payment actions must be done by the user in the browser.' };

@@ -47,9 +47,42 @@ export async function readPageOutline(page: Page): Promise<PageOutline> {
       }
       return [...seen];
     }
+    // Nearest heading above a control, so repeated buttons ("Add" on every
+    // income row) can be told apart.
+    function contextOf(el: Element): string {
+      let node: Element | null = el.parentElement;
+      for (let i = 0; i < 8 && node; i++) {
+        const heading = Array.from(node.querySelectorAll<HTMLElement>('h1, h2, h3, h4, h5, h6, legend, .title')).find(h => !h.contains(el) && isShown(h));
+        if (heading) {
+          return heading.innerText
+            .replace(/open faq window/gi, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+        }
+        node = node.parentElement;
+      }
+      return '';
+    }
+    function buttons(limit: number): string[] {
+      const entries: Array<{ text: string; context: string }> = [];
+      for (const el of document.querySelectorAll<HTMLElement>('button, input[type="submit"], input[type="button"], [role="button"]')) {
+        if (!isShown(el)) continue;
+        const text = (el.getAttribute('aria-label') || (el as HTMLInputElement).value || el.innerText || '').replace(/\s+/g, ' ').trim();
+        if (text && text.length <= 120) entries.push({ text, context: contextOf(el) });
+      }
+      const contextsByText = new Map<string, Set<string>>();
+      for (const e of entries) contextsByText.set(e.text, (contextsByText.get(e.text) ?? new Set()).add(e.context));
+      const seen = new Set<string>();
+      for (const e of entries) {
+        const distinct = (contextsByText.get(e.text)?.size ?? 0) > 1;
+        seen.add(distinct && e.context ? `${e.text} (${e.context})` : e.text);
+        if (seen.size >= limit) break;
+      }
+      return [...seen];
+    }
     return {
       headings: texts('h1, h2, h3', 20),
-      buttons: texts('button, input[type="submit"], input[type="button"], [role="button"]', 40),
+      buttons: buttons(60),
       links: texts('a[href]', 80),
     };
   });
@@ -138,12 +171,17 @@ export async function readFormFields(page: Page): Promise<FormField[]> {
     }
 
     const groups = new Map<string, { label: string; value: string; options: string[] }>();
-    for (const el of document.querySelectorAll<HTMLInputElement>('input[type="radio"]')) {
-      if (!isShown(el)) continue;
+    const radios = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="radio"]')).filter(isShown);
+    const radioNames = new Set(radios.map(r => r.getAttribute('name') ?? ''));
+    const pageHeading = labelText(document.querySelector('h1'));
+    for (const el of radios) {
       const name = el.getAttribute('name') ?? '';
       let group = groups.get(name);
       if (!group) {
-        group = { label: groupLabel(el, name), value: '', options: [] };
+        let label = groupLabel(el, name);
+        // A lone group with no label of its own is answering the page heading.
+        if (label === name && radioNames.size === 1 && pageHeading) label = pageHeading;
+        group = { label, value: '', options: [] };
         groups.set(name, group);
       }
       const optLabel = labelFor(el);
@@ -179,6 +217,8 @@ async function describeLabels(locator: Locator): Promise<string[]> {
 }
 
 export async function resolveLabel(page: Page, label: string): Promise<LabelResolution> {
+  // Repeatable blocks (extra W-2 states, localities) keep hidden template
+  // rows in the DOM with the same labels, so only visible fields count.
   const attempts: Locator[] = [
     page.getByLabel(label, { exact: true }),
     page.getByLabel(new RegExp(`^\\s*${escapeRegExp(label)}\\s*[:*]?\\s*$`, 'i')),
@@ -186,7 +226,7 @@ export async function resolveLabel(page: Page, label: string): Promise<LabelReso
     // and trailing colon removed, so match on the label as a prefix.
     page.getByLabel(new RegExp(`^\\s*${escapeRegExp(label)}\\s*[:*]?(\\s*open faq window)?\\s*(\\(|$)`, 'i')),
     page.getByLabel(label, { exact: false }),
-  ];
+  ].map(l => l.filter({ visible: true }));
   for (const locator of attempts) {
     const count = await locator.count();
     if (count === 1) {
@@ -241,6 +281,15 @@ async function findRadioInGroup(page: Page, question: string, option: string): P
         const key = groupOf(el);
         groups.set(key, [...(groups.get(key) ?? []), el]);
       }
+      // A lone group with no label of its own is answering the page heading.
+      if (groups.size === 1) {
+        const [key, els] = [...groups.entries()][0];
+        const heading = clean(document.querySelector('h1')?.textContent ?? '');
+        if (key === clean(els[0].name) && heading) {
+          groups.delete(key);
+          groups.set(heading, els);
+        }
+      }
       const names = [...groups.keys()];
       const exact = names.filter(n => n === want);
       const partial = exact.length > 0 ? exact : names.filter(n => n.includes(want) || want.includes(n));
@@ -254,6 +303,17 @@ async function findRadioInGroup(page: Page, question: string, option: string): P
   );
 }
 
+/**
+ * Tile-style choices keep the real input 1x1px and visually hidden behind a
+ * styled label, so check() cannot hit it; clicking the label does the same.
+ */
+async function checkViaLabel(page: Page, locator: Locator, checked: boolean): Promise<void> {
+  const id = await locator.getAttribute('id');
+  const target = id ? page.locator(`label[for="${id.replace(/"/g, '\\"')}"]`).first() : locator.locator('xpath=ancestor::label[1]');
+  const isChecked = await locator.isChecked().catch(() => false);
+  if (isChecked !== checked) await target.click({ timeout: 2_000 });
+}
+
 export async function setFieldByLabel(page: Page, label: string, value: string, kind: FieldKind = 'auto'): Promise<FieldResult> {
   const resolved = await resolveLabel(page, label);
   if (!resolved.ok) {
@@ -261,8 +321,9 @@ export async function setFieldByLabel(page: Page, label: string, value: string, 
     if (kind === 'radio' || kind === 'auto') {
       const radio = await findRadioInGroup(page, label, value);
       if (radio.id) {
+        const input = page.locator(`input[type="radio"][id="${radio.id.replace(/"/g, '\\"')}"]`);
         try {
-          await page.locator(`input[type="radio"][id="${radio.id.replace(/"/g, '\\"')}"]`).check({ timeout: 1_000 });
+          await input.check({ timeout: 1_000 }).catch(() => checkViaLabel(page, input, true));
           return { ok: true, matchedLabel: label, via: 'radio' };
         } catch (err) {
           return { ok: false, matchedLabel: label, via: 'radio', reason: errorMessage(err) };
@@ -285,7 +346,7 @@ export async function setFieldByLabel(page: Page, label: string, value: string, 
   }
 
   try {
-    await locator.waitFor({ state: 'visible', timeout: 1_000 });
+    if (detected === 'text' || detected === 'select') await locator.waitFor({ state: 'visible', timeout: 1_000 });
     switch (detected) {
       case 'select':
         try {
@@ -294,11 +355,13 @@ export async function setFieldByLabel(page: Page, label: string, value: string, 
           await locator.selectOption({ value }, { timeout: 1_000 });
         }
         break;
-      case 'checkbox':
-        await locator.setChecked(/^(true|yes|1|checked|on)$/i.test(value), { timeout: 1_000 });
+      case 'checkbox': {
+        const on = /^(true|yes|1|checked|on)$/i.test(value);
+        await locator.setChecked(on, { timeout: 1_000 }).catch(() => checkViaLabel(page, locator, on));
         break;
+      }
       case 'radio':
-        await locator.check({ timeout: 1_000 });
+        await locator.check({ timeout: 1_000 }).catch(() => checkViaLabel(page, locator, true));
         break;
       default:
         await locator.fill(value, { timeout: 1_000 });
@@ -340,20 +403,46 @@ export type ButtonResolution =
   | { ok: true; locator: Locator; name: string }
   | { ok: false; reason: 'not_found' | 'ambiguous'; candidates: string[] };
 
-export async function findButton(page: Page, name: string): Promise<ButtonResolution> {
+export async function findButton(page: Page, name: string, context?: string): Promise<ButtonResolution> {
   // An open modal covers the page, so its buttons are the only ones clickable.
   const scope: Page | Frame = activeModalFrame(page) ?? page;
-  const exact = scope.getByRole('button', { name, exact: true }).or(scope.getByRole('link', { name, exact: true }));
+  const visible = (l: Locator): Locator => l.filter({ visible: true });
+  const exact = visible(scope.getByRole('button', { name, exact: true }).or(scope.getByRole('link', { name, exact: true })));
   let target = exact;
   let count = await exact.count();
   if (count === 0) {
     const pattern = new RegExp(`\\b${escapeRegExp(name)}\\b`, 'i');
-    target = scope.getByRole('button', { name: pattern }).or(scope.getByRole('link', { name: pattern }));
+    target = visible(scope.getByRole('button', { name: pattern }).or(scope.getByRole('link', { name: pattern })));
     count = await target.count();
   }
   if (count === 0) return { ok: false, reason: 'not_found', candidates: [] };
+
+  const contexts = await target.evaluateAll(elements =>
+    elements.map(el => {
+      let node: Element | null = el.parentElement;
+      for (let i = 0; i < 8 && node; i++) {
+        const heading = Array.from(node.querySelectorAll<HTMLElement>('h1, h2, h3, h4, h5, h6, legend, .title')).find(
+          h => !h.contains(el) && h.getClientRects().length > 0,
+        );
+        if (heading) return heading.innerText.replace(/open faq window/gi, '').replace(/\s+/g, ' ').trim();
+        node = node.parentElement;
+      }
+      return '';
+    }),
+  );
   const names = (await target.allInnerTexts()).map(t => t.trim());
-  if (count > 1) return { ok: false, reason: 'ambiguous', candidates: names };
+  // Context only helps when it differs between the candidates.
+  const distinct = new Set(contexts).size > 1;
+  const labelled = names.map((n, i) => (distinct && contexts[i] ? `${n || name} (${contexts[i]})` : n || name));
+
+  if (context) {
+    const wanted = context.toLowerCase();
+    const hits = contexts.map((c, i) => (c.toLowerCase().includes(wanted) ? i : -1)).filter(i => i >= 0);
+    if (hits.length === 1) return { ok: true, locator: target.nth(hits[0]), name: labelled[hits[0]] };
+    if (hits.length === 0) return { ok: false, reason: 'not_found', candidates: labelled };
+    return { ok: false, reason: 'ambiguous', candidates: hits.map(i => labelled[i]) };
+  }
+  if (count > 1) return { ok: false, reason: 'ambiguous', candidates: labelled };
   return { ok: true, locator: target.first(), name: names[0] || name };
 }
 
@@ -361,7 +450,7 @@ export async function findButton(page: Page, name: string): Promise<ButtonResolu
 export async function clickSaveAndContinue(page: Page): Promise<boolean> {
   const button = page
     .getByRole('button', { name: /save and continue/i })
-    .or(page.getByRole('button', { name: /^continue$/i }))
+    .or(page.getByRole('button', { name: /^continue\b/i }))
     .or(page.locator('input[type="submit"][value*="Continue" i]'))
     .first();
   try {
@@ -392,6 +481,7 @@ export async function getValidationErrors(page: Page): Promise<string[]> {
 
 export async function getPageTitle(page: Page): Promise<string> {
   const h1 = await page.locator('h1').first().innerText({ timeout: 1_000 }).catch(() => '');
-  if (h1.trim()) return h1.trim();
+  const clean = h1.replace(/open faq window/gi, '').replace(/\s+/g, ' ').trim();
+  if (clean) return clean;
   return page.title();
 }

@@ -24,6 +24,15 @@ async function readLabeledAmounts(): Promise<LabeledAmounts> {
   const page = await getPage();
   const pairs = await page.evaluate(() => {
     const out: Array<{ label: string; text: string }> = [];
+    // The header refund boxes: <div class="refund-box"><div class="title">Federal Refund:</div><div class="amount">$685</div></div>
+    for (const box of document.querySelectorAll<HTMLElement>('.refund-box')) {
+      if (box.getClientRects().length === 0) continue;
+      const label = box.querySelector('.title')?.textContent?.replace(/\s+/g, ' ').trim() ?? '';
+      const amount = box.querySelector('.amount')?.textContent?.trim() ?? '';
+      if (label && amount) out.push({ label, text: `${label} ${amount}` });
+    }
+    if (out.length > 0) return out;
+
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
     let node = walker.nextNode();
     while (node) {
@@ -34,7 +43,7 @@ async function readLabeledAmounts(): Promise<LabeledAmounts> {
         .join(' ')
         .trim();
       if (own.length > 0 && own.length < 60 && /\b(federal|state)\b/i.test(own) && /\b(refund|due|owe|owed|balance)\b/i.test(own)) {
-        const container = el.closest('tr, li, div, p, dl') ?? el;
+        const container = el.parentElement?.closest('tr, li, div, p, dl') ?? el;
         out.push({ label: own, text: (container.textContent ?? '').trim().slice(0, 200) });
       }
       node = walker.nextNode();
@@ -44,7 +53,8 @@ async function readLabeledAmounts(): Promise<LabeledAmounts> {
 
   const amounts: LabeledAmounts = { federalRefund: null, federalOwed: null, stateRefund: null, stateOwed: null };
   for (const { label, text } of pairs) {
-    const isState = /\bstate\b/i.test(label);
+    // The state box is labelled by state name ("PA Refund: Pennsylvania Refund:").
+    const isState = !/\bfederal\b/i.test(label);
     const isOwed = /\b(due|owe|owed|balance)\b/i.test(label);
     const amount = parseAmount(text.replace(label, ''));
     if (amount === null) continue;
@@ -100,18 +110,30 @@ export async function getTaxSummary(): Promise<Record<string, unknown>> {
         .filter((r): r is { label: string; value: string } => r !== null),
     );
 
-    const find = (pattern: RegExp): string | null => rows.find(r => pattern.test(r.label))?.value ?? null;
-    const agi = parseAmount(find(/adjusted gross income|\bAGI\b/i));
-    const refund = parseAmount(find(/refund/i));
-    const owed = parseAmount(find(/amount (due|owed)|balance due|you owe/i));
+    // Labels carry the nested FAQ button text ("TOTAL REFUND Open FAQ window").
+    const find = (pattern: RegExp): string | null =>
+      rows.find(r => pattern.test(r.label.replace(/open faq window/gi, '').trim()))?.value ?? null;
+    const agi = parseAmount(find(/^adjusted gross income|\bAGI\b/i));
+    // "Taxable State Refunds" is an income row; the bottom line is "TOTAL REFUND".
+    const refund = parseAmount(find(/^(total )?refund$/i));
+    const owed = parseAmount(find(/^total amount owed$|amount (due|owed)|balance due|you owe/i));
+    const totalIncome = parseAmount(find(/^total income$/i));
+    const taxableIncome = parseAmount(find(/^taxable income$/i));
+    const totalTax = parseAmount(find(/^total tax$/i));
+    const totalPayments = parseAmount(find(/^total payments$/i));
     const filingStatus = find(/filing status/i);
 
+    const refundOrOwed = refund !== null && refund > 0 ? 'refund' : owed !== null && owed > 0 ? 'owed' : refund !== null || owed !== null ? 'none' : 'unknown';
     return {
       success: true,
       source: 'summary_table',
-      refundOrOwed: refund !== null ? 'refund' : owed !== null ? 'owed' : 'unknown',
-      amount: refund ?? owed,
+      refundOrOwed,
+      amount: refundOrOwed === 'refund' ? refund : refundOrOwed === 'owed' ? owed : 0,
+      totalIncome,
       agi,
+      taxableIncome,
+      totalTax,
+      totalPayments,
       filingStatus,
       note: 'Confirm against the browser window before relying on these figures.',
     };
