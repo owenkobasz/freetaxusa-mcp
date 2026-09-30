@@ -1,7 +1,7 @@
 {
   "name": "freetaxusa-mcp",
   "version": "1.1.0",
-  "description": "MCP server for FreeTaxUSA tax filing via Playwright. Manual login in a visible browser; the model never sees your password.",
+  "description": "An experiment in letting Claude fill out a FreeTaxUSA return in a browser you can watch. Test accounts only.",
   "type": "module",
   "main": "dist/index.js",
   "bin": {

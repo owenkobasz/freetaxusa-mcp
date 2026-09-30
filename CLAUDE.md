@@ -28,6 +28,7 @@ npm run dev      # Run with tsx
 
 ## Working rules
 
+- This is only ever run against a test account with made-up data. Don't suggest entering real tax information.
 - Never ask the user for their FreeTaxUSA password or MFA code. `login_manual` opens the window; they sign in (hCaptcha, sometimes an emailed code, occasionally a Cloudflare checkbox).
 - The session idles out after about 10 minutes (`THApp` cookie). A `session_expired` result means sign in again in the same window, then `login_manual`.
 - Claude reads and fills. The user reviews, pays for state, and files. Those pages are refused by the guards.
